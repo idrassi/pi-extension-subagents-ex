@@ -1,0 +1,10 @@
+import { Scheduler } from "../../src/scheduler.ts";
+import * as fs from "node:fs";
+import { setTimeout as delay } from "node:timers/promises";
+const [id, worker, log] = process.argv.slice(2);
+const scheduler = new Scheduler(id, { concurrency: 2 });
+const release = await scheduler.acquire(worker);
+fs.appendFileSync(log, `${JSON.stringify({ event: "start", worker, time: Date.now() })}\n`);
+await delay(50);
+fs.appendFileSync(log, `${JSON.stringify({ event: "end", worker, time: Date.now() })}\n`);
+await release();

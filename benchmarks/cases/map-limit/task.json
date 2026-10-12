@@ -1,0 +1,1 @@
+{"id":"map-limit","task":"Fix mapLimit(items, limit, fn) in lib.mjs. Run at most limit async callbacks at once, pass (item,index), and return results in original input order regardless of completion order. Empty input returns []. Reject invalid limits unless they are positive integers. Propagate callback failures. Do not mutate the input. Edit only lib.mjs. Add no dependencies."}

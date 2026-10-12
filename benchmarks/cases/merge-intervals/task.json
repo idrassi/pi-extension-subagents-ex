@@ -1,0 +1,1 @@
+{"id":"merge-intervals","task":"Fix mergeIntervals in lib.mjs. Accept unsorted [start,end] pairs, merge overlapping or touching closed intervals, preserve isolated intervals, return [] for empty input, and do not mutate the input or its inner arrays. Edit only lib.mjs. Add no dependencies."}

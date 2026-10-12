@@ -1,0 +1,11 @@
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+const { mapLimit } = await import(pathToFileURL(`${process.env.EVAL_WORKSPACE}/lib.mjs`).href);
+let active = 0, peak = 0;
+const input = Object.freeze([20, 2, 10, 1]);
+const output = await mapLimit(input, 2, async (ms, i) => { peak = Math.max(peak, ++active); await new Promise((r) => setTimeout(r, ms)); active--; return i; });
+assert.deepEqual(output, [0, 1, 2, 3]);
+assert.equal(peak, 2);
+assert.deepEqual(await mapLimit([], 1, () => { throw new Error("unreachable"); }), []);
+for (const limit of [0, -1, 0.5, Infinity, NaN]) await assert.rejects(() => mapLimit([1], limit, (x) => x));
+await assert.rejects(() => mapLimit([1], 1, async () => { throw new Error("callback failed"); }), /callback failed/);

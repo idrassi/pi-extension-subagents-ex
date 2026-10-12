@@ -1,0 +1,17 @@
+import assert from "node:assert/strict";
+import { pathToFileURL } from "node:url";
+const { memoizeAsync } = await import(pathToFileURL(`${process.env.EVAL_WORKSPACE}/lib.mjs`).href);
+let calls = 0;
+const cached = memoizeAsync(async (key) => { calls++; await new Promise((r) => setTimeout(r, 5)); return key === "zero" ? 0 : key; });
+assert.deepEqual(await Promise.all([cached("zero"), cached("zero"), cached("other")]), [0, 0, "other"]);
+assert.equal(calls, 2);
+await cached("zero");
+assert.equal(calls, 2);
+let attempts = 0;
+const retry = memoizeAsync(() => { if (++attempts === 1) throw new Error("temporary"); return false; });
+const failed = retry("x");
+assert.ok(failed instanceof Promise);
+await assert.rejects(failed, /temporary/);
+assert.equal(await retry("x"), false);
+assert.equal(await retry("x"), false);
+assert.equal(attempts, 2);
