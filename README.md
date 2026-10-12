@@ -6,7 +6,21 @@ Requires **Node.js 22.19+ and pi 0.86.0 or later** (verified through pi **0.99.1
 
 ## Install
 
-Use the release archive `pi-subagents-ex-1.0.0.tgz` on any machine with the Node.js and pi versions above. Extract it into pi's extensions directory:
+With Git installed, install directly from GitHub, pinned to **v1.0.0**:
+
+```bash
+pi install https://github.com/idrassi/pi-extension-subagents-ex@v1.0.0
+```
+
+To install the latest code from the repository's default branch, omit the tag:
+
+```bash
+pi install https://github.com/idrassi/pi-extension-subagents-ex
+```
+
+The default branch may include unreleased changes. Pi installs runtime dependencies automatically. Run `/reload` in an existing pi session after installation.
+
+Alternatively, download the release archive `pi-subagents-ex-1.0.0.tgz` and extract it into pi's extensions directory:
 
 ```bash
 mkdir -p ~/.pi/agent/extensions/subagents-ex
@@ -17,7 +31,7 @@ For a new installation, use an empty destination directory. Run `/reload` in pi 
 
 The archive contains the extension's TypeScript modules, bundled agents and prompts, and its runtime dependencies. It excludes development tools, tests, benchmarks, and repository metadata. Pi supplies its own SDK packages, so no separate `npm install` is needed on the destination machine.
 
-The two directories serve different purposes:
+For archive installations, the two directories serve different purposes:
 
 - `~/.pi/agent/extensions/subagents-ex/` contains the installed extension.
 - `~/.pi/agent/subagents-ex/` contains saved runs, child sessions, task records, and artifacts. It is created during use and does not need to be copied to install the extension elsewhere.
