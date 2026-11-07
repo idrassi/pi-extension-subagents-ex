@@ -1,24 +1,11 @@
-/**
- * TUI renderers for the subagent tool (call header + result views),
- * adapted from pi's subagent example and extended with statuses, budgets,
- * attempts, worktrees and background task cards.
- */
+/** TUI views use bounded DTO previews and artifact references, never transcripts. */
 
 import { getMarkdownTheme } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
-import {
-	type DisplayItem,
-	aggregateUsage,
-	formatDuration,
-	formatToolCall,
-	formatUsageStats,
-	getDisplayItems,
-	getFinalOutput,
-} from "./format.ts";
-import type { RunRecord, RunStatus, SubagentDetails } from "./types.ts";
+import { aggregateUsage, formatDuration, formatUsageStats, truncateToBytes } from "./format.ts";
+import { boundedResult, compactDetails } from "./results.ts";
+import type { RunResult, RunStatus, SubagentDetails } from "./types.ts";
 import { isRunFailed } from "./types.ts";
-
-const COLLAPSED_ITEM_COUNT = 10;
 
 interface Theme {
 	fg(color: any, text: string): string;
@@ -42,44 +29,32 @@ function statusIcon(status: RunStatus, theme: Theme): string {
 	}
 }
 
-function recordHeaderLine(r: RunRecord, theme: Theme): string {
-	const icon = statusIcon(r.status, theme);
-	let line = `${icon} ${theme.fg("toolTitle", theme.bold(r.agent))}${theme.fg("muted", ` (${r.agentSource})`)}`;
-	if (r.status !== "ok" && r.status !== "running") line += ` ${theme.fg("error", `[${r.status}]`)}`;
-	if (r.attempts > 1) line += theme.fg("dim", ` attempt ${r.attempts}`);
+function recordHeaderLine(run: RunResult, theme: Theme): string {
+	let line = `${statusIcon(run.status, theme)} ${theme.fg("toolTitle", theme.bold(run.agent))}${theme.fg("muted", ` (${run.agentSource})`)}`;
+	if (run.status !== "ok" && run.status !== "running") line += ` ${theme.fg("error", `[${run.status}]`)}`;
+	if (run.attempts > 1) line += theme.fg("dim", ` attempt ${run.attempts}`);
 	return line;
 }
 
-function recordMetaLines(r: RunRecord, theme: Theme): string[] {
-	const lines: string[] = [];
-	if (r.errorMessage && r.status !== "ok") lines.push(theme.fg("error", `Error: ${r.errorMessage}`));
-	if (r.worktree) {
-		lines.push(
-			theme.fg("muted", "worktree: ") +
-				theme.fg("accent", r.worktree.path) +
-				theme.fg("dim", ` (branch ${r.worktree.branch})`),
-		);
-	}
+function recordMetaLines(run: RunResult, theme: Theme): string[] {
+	const lines = [theme.fg("dim", `run: ${run.id}${run.treeId ? ` · tree: ${run.treeId}` : ""}`)];
+	if (run.errorMessage && run.status !== "ok") lines.push(theme.fg("error", `Error: ${run.errorMessage}`));
+	if (run.worktree) lines.push(theme.fg("muted", "worktree: ") + theme.fg("accent", run.worktree.path) + theme.fg("dim", ` (branch ${run.worktree.branch})`));
 	return lines;
 }
 
-function renderDisplayItems(items: DisplayItem[], expanded: boolean, theme: Theme, limit?: number): string {
-	const toShow = limit ? items.slice(-limit) : items;
-	const skipped = limit && items.length > limit ? items.length - limit : 0;
-	let text = "";
-	if (skipped > 0) text += theme.fg("muted", `... ${skipped} earlier items\n`);
-	for (const item of toShow) {
-		if (item.type === "text") {
-			const preview = expanded ? item.text : item.text.split("\n").slice(0, 3).join("\n");
-			text += `${theme.fg("toolOutput", preview)}\n`;
-		} else {
-			text += `${theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme))}\n`;
-		}
+function artifactLines(run: RunResult, theme: Theme): string[] {
+	const lines = [theme.fg("dim", `Full output: subagent_run_output · runId: ${run.id}`)];
+	for (const key of ["output", "manifest", "patch"] as const) {
+		const file = run.artifacts?.[key];
+		if (file) lines.push(theme.fg("muted", `${key}: `) + theme.fg("accent", file));
 	}
-	return text.trimEnd();
+	if (run.sessionFile) lines.push(theme.fg("muted", "session: ") + theme.fg("accent", run.sessionFile));
+	if (run.metadataTruncated) lines.push(theme.fg("dim", "Additional metadata is in the saved run."));
+	return lines;
 }
 
-function usageLine(records: RunRecord[], prefix: string | undefined, theme: Theme): string {
+function usageLine(records: RunResult[], prefix: string | undefined, theme: Theme): string {
 	const stats = records.length === 1 ? records[0].usage : aggregateUsage(records);
 	const model = records.length === 1 ? records[0].model : undefined;
 	const str = formatUsageStats(stats, model);
@@ -148,244 +123,98 @@ export function renderSubagentCall(args: any, theme: Theme): Text {
 // renderResult
 // ---------------------------------------------------------------------------
 
+function fallbackResult(result: any): Text {
+	const content = result.content?.find((part: any) => part.type === "text");
+	const bounded = boundedResult(content?.text ?? "(no output)", undefined);
+	return new Text(bounded.content[0].type === "text" ? bounded.content[0].text : "(no output)", 0, 0);
+}
+
 export function renderSubagentResult(result: any, options: { expanded: boolean }, theme: Theme): any {
-	const details = result.details as SubagentDetails | undefined;
-	const expanded = options.expanded;
-
-	if (!details || (details.results.length === 0 && details.mode !== "background")) {
-		const text = result.content[0];
-		return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+	if (!Array.isArray(result.details?.results)) return fallbackResult(result);
+	let details: SubagentDetails;
+	try {
+		// Old sessions may still contain RunRecords. Project them before rendering;
+		// expanding must not iterate/render their tool calls or nested transcripts.
+		details = compactDetails(result.details);
+	} catch {
+		return fallbackResult(result);
 	}
-
 	if (details.mode === "background") {
-		let text =
-			theme.fg("warning", "⏳ ") +
-			theme.fg("toolTitle", theme.bold("background ")) +
-			theme.fg("accent", details.taskId ?? "") +
-			theme.fg("muted", " started");
+		let text = theme.fg("warning", "⏳ ") + theme.fg("toolTitle", theme.bold("background ")) + theme.fg("accent", details.taskId ?? "") + theme.fg("muted", " started");
 		if (details.notify) text += theme.fg("dim", " · completion will be reported automatically");
 		text += `\n${theme.fg("dim", "Collect with subagent_task_output · manage with /agents")}`;
 		return new Text(text, 0, 0);
 	}
-
-	const mdTheme = getMarkdownTheme();
-
-	if (details.mode === "single" && details.results.length === 1) {
-		return renderSingle(details.results[0], expanded, theme, mdTheme);
+	if (!details.results.length) return fallbackResult(result);
+	if (details.mode === "single" && details.results.length === 1)
+		return renderSingle(details.results[0], options.expanded, theme);
+	const running = details.results.filter((run) => run.status === "running" || run.status === "queued").length;
+	const failed = details.results.filter(isRunFailed).length;
+	const successful = details.results.length - running - failed;
+	const icon = running ? theme.fg("warning", "⏳") : failed ? theme.fg("warning", "◐") : theme.fg("success", "✓");
+	const label = details.mode === "chain" ? `${successful}/${details.results.length} steps` : running
+		? `${successful + failed}/${details.results.length} done, ${running} running` : `${successful}/${details.results.length} tasks`;
+	const header = `${icon} ${theme.fg("toolTitle", theme.bold(`${details.mode} `))}${theme.fg("accent", label)}`;
+	if (options.expanded) {
+		const container = new Container();
+		container.addChild(new Text(header, 0, 0));
+		for (const run of details.results) {
+			container.addChild(new Spacer(1));
+			if (run.step) container.addChild(new Text(theme.fg("muted", `─── Step ${run.step} ───`), 0, 0));
+			container.addChild(renderSingle(run, true, theme));
+		}
+		const total = usageLine(details.results, "Total: ", theme);
+		if (total) container.addChild(new Text(total, 0, 0));
+		return container;
 	}
-	if (details.mode === "chain") {
-		return renderChain(details.results, expanded, theme, mdTheme);
+	let text = header;
+	for (const run of details.results) {
+		text += `\n\n${recordHeaderLine(run, theme)}\n${theme.fg("dim", `run: ${run.id}`)}\n${collapsedOutput(run, theme)}`;
 	}
-	if (details.mode === "parallel") {
-		return renderParallel(details.results, expanded, theme, mdTheme);
-	}
-
-	const text = result.content[0];
-	return new Text(text?.type === "text" ? text.text : "(no output)", 0, 0);
+	const total = usageLine(details.results, "Total: ", theme);
+	if (total) text += `\n\n${total}`;
+	text += `\n${theme.fg("muted", "(Ctrl+O for previews and artifact references)")}`;
+	return new Text(text, 0, 0);
 }
 
-function renderSingle(r: RunRecord, expanded: boolean, theme: Theme, mdTheme: any): any {
-	const displayItems = getDisplayItems(r.messages);
-	const finalOutput = getFinalOutput(r.messages);
+function collapsedOutput(run: RunResult, theme: Theme): string {
+	if (!run.output) return theme.fg("muted", run.status === "running" || run.status === "queued" ? "(running...)" : "(no output preview)");
+	const lines = run.output.split("\n");
+	const clipped = truncateToBytes(lines.slice(0, 3).join("\n"), 512);
+	return theme.fg("toolOutput", clipped.text) + (clipped.truncated || lines.length > 3 || run.outputTruncated ? theme.fg("dim", " … (preview)") : "");
+}
 
-	if (expanded) {
-		const container = new Container();
-		container.addChild(new Text(recordHeaderLine(r, theme), 0, 0));
-		for (const line of recordMetaLines(r, theme)) container.addChild(new Text(line, 0, 0));
+function renderSingle(run: RunResult, expanded: boolean, theme: Theme): any {
+	if (!expanded) {
+		const lines = [recordHeaderLine(run, theme), ...recordMetaLines(run, theme), collapsedOutput(run, theme)];
+		const usage = usageLine([run], undefined, theme);
+		if (usage) lines.push(usage);
+		return new Text(lines.join("\n"), 0, 0);
+	}
+	const container = new Container();
+	container.addChild(new Text(recordHeaderLine(run, theme), 0, 0));
+	for (const line of recordMetaLines(run, theme)) container.addChild(new Text(line, 0, 0));
+	if (run.task) {
 		container.addChild(new Spacer(1));
-		container.addChild(new Text(theme.fg("muted", "─── Task ───"), 0, 0));
-		container.addChild(new Text(theme.fg("dim", r.task), 0, 0));
-		container.addChild(new Spacer(1));
-		container.addChild(new Text(theme.fg("muted", "─── Output ───"), 0, 0));
-		if (displayItems.length === 0 && !finalOutput) {
-			container.addChild(new Text(theme.fg("muted", "(no output)"), 0, 0));
-		} else {
-			for (const item of displayItems) {
-				if (item.type === "toolCall") {
-					container.addChild(
-						new Text(theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)), 0, 0),
-					);
-				}
-			}
-			if (finalOutput) {
-				container.addChild(new Spacer(1));
-				container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
-			}
-		}
-		const stats = usageLine([r], undefined, theme);
-		if (stats) {
-			container.addChild(new Spacer(1));
-			container.addChild(new Text(stats, 0, 0));
-		}
-		return container;
+		container.addChild(new Text(theme.fg("muted", "─── Task preview ───"), 0, 0));
+		container.addChild(new Text(theme.fg("dim", run.task), 0, 0));
 	}
-
-	let text = recordHeaderLine(r, theme);
-	for (const line of recordMetaLines(r, theme)) text += `\n${line}`;
-	if (displayItems.length === 0) {
-		if (!r.errorMessage) text += `\n${theme.fg("muted", "(no output)")}`;
-	} else {
-		text += `\n${renderDisplayItems(displayItems, false, theme, COLLAPSED_ITEM_COUNT)}`;
-		if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
-	}
-	const stats = usageLine([r], undefined, theme);
-	if (stats) text += `\n${stats}`;
-	return new Text(text, 0, 0);
-}
-
-function renderChain(results: RunRecord[], expanded: boolean, theme: Theme, mdTheme: any): any {
-	const doneCount = results.filter((r) => r.status === "ok").length;
-	const running = results.some((r) => r.status === "running" || r.status === "queued");
-	const icon = running
-		? theme.fg("warning", "⏳")
-		: doneCount === results.length
-			? theme.fg("success", "✓")
-			: theme.fg("error", "✗");
-
-	if (expanded) {
-		const container = new Container();
-		container.addChild(
-			new Text(
-				`${icon} ${theme.fg("toolTitle", theme.bold("chain "))}${theme.fg("accent", `${doneCount}/${results.length} steps`)}`,
-				0,
-				0,
-			),
-		);
-
-		for (const r of results) {
-			const displayItems = getDisplayItems(r.messages);
-			const finalOutput = getFinalOutput(r.messages);
-
-			container.addChild(new Spacer(1));
-			container.addChild(
-				new Text(
-					`${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${statusIcon(r.status, theme)}${r.attempts > 1 ? theme.fg("dim", ` (attempt ${r.attempts})`) : ""}`,
-					0,
-					0,
-				),
-			);
-			container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
-			if (r.errorMessage && r.status !== "ok") {
-				container.addChild(new Text(theme.fg("error", `Error: ${r.errorMessage}`), 0, 0));
-			}
-			if (r.worktree) {
-				container.addChild(new Text(theme.fg("muted", "worktree: ") + theme.fg("accent", r.worktree.path), 0, 0));
-			}
-			for (const item of displayItems) {
-				if (item.type === "toolCall") {
-					container.addChild(
-						new Text(theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)), 0, 0),
-					);
-				}
-			}
-			if (finalOutput) {
-				container.addChild(new Spacer(1));
-				container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
-			}
-			const stepUsage = formatUsageStats(r.usage, r.model);
-			if (stepUsage) container.addChild(new Text(theme.fg("dim", stepUsage), 0, 0));
-		}
-
-		const total = usageLine(results, "Total: ", theme);
-		if (total) {
-			container.addChild(new Spacer(1));
-			container.addChild(new Text(total, 0, 0));
-		}
-		return container;
-	}
-
-	let text = `${icon} ${theme.fg("toolTitle", theme.bold("chain "))}${theme.fg("accent", `${doneCount}/${results.length} steps`)}`;
-	for (const r of results) {
-		const displayItems = getDisplayItems(r.messages);
-		text += `\n\n${theme.fg("muted", `─── Step ${r.step}: `)}${theme.fg("accent", r.agent)} ${statusIcon(r.status, theme)}`;
-		if (displayItems.length === 0)
-			text += `\n${theme.fg("muted", r.status === "running" ? "(running...)" : "(no output)")}`;
-		else text += `\n${renderDisplayItems(displayItems, false, theme, 5)}`;
-	}
-	if (!running) {
-		const total = usageLine(results, "Total: ", theme);
-		if (total) text += `\n\n${total}`;
-	}
-	text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
-	return new Text(text, 0, 0);
-}
-
-function renderParallel(results: RunRecord[], expanded: boolean, theme: Theme, mdTheme: any): any {
-	const running = results.filter((r) => r.status === "running" || r.status === "queued").length;
-	const failCount = results.filter((r) => r.status !== "running" && isRunFailed(r)).length;
-	const successCount = results.length - running - failCount;
-	const isRunning = running > 0;
-	const icon = isRunning
-		? theme.fg("warning", "⏳")
-		: failCount > 0
-			? theme.fg("warning", "◐")
-			: theme.fg("success", "✓");
-	const status = isRunning
-		? `${successCount + failCount}/${results.length} done, ${running} running`
-		: `${successCount}/${results.length} tasks`;
-
-	if (expanded && !isRunning) {
-		const container = new Container();
-		container.addChild(
-			new Text(`${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`, 0, 0),
-		);
-
-		for (const r of results) {
-			const displayItems = getDisplayItems(r.messages);
-			const finalOutput = getFinalOutput(r.messages);
-
-			container.addChild(new Spacer(1));
-			container.addChild(
-				new Text(`${theme.fg("muted", "─── ") + theme.fg("accent", r.agent)} ${statusIcon(r.status, theme)}`, 0, 0),
-			);
-			container.addChild(new Text(theme.fg("muted", "Task: ") + theme.fg("dim", r.task), 0, 0));
-			for (const line of recordMetaLines(r, theme)) container.addChild(new Text(line, 0, 0));
-			for (const item of displayItems) {
-				if (item.type === "toolCall") {
-					container.addChild(
-						new Text(theme.fg("muted", "→ ") + formatToolCall(item.name, item.args, theme.fg.bind(theme)), 0, 0),
-					);
-				}
-			}
-			if (finalOutput) {
-				container.addChild(new Spacer(1));
-				container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
-			}
-			const taskUsage = formatUsageStats(r.usage, r.model);
-			if (taskUsage) container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
-		}
-
-		const total = usageLine(results, "Total: ", theme);
-		if (total) {
-			container.addChild(new Spacer(1));
-			container.addChild(new Text(total, 0, 0));
-		}
-		return container;
-	}
-
-	let text = `${icon} ${theme.fg("toolTitle", theme.bold("parallel "))}${theme.fg("accent", status)}`;
-	for (const r of results) {
-		const displayItems = getDisplayItems(r.messages);
-		text += `\n\n${theme.fg("muted", "─── ")}${theme.fg("accent", r.agent)} ${statusIcon(r.status, theme)}`;
-		if (displayItems.length === 0)
-			text += `\n${theme.fg("muted", r.status === "running" ? "(running...)" : "(no output)")}`;
-		else text += `\n${renderDisplayItems(displayItems, false, theme, 5)}`;
-	}
-	if (!isRunning) {
-		const total = usageLine(results, "Total: ", theme);
-		if (total) text += `\n\n${total}`;
-	}
-	if (!expanded) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
-	return new Text(text, 0, 0);
+	container.addChild(new Spacer(1));
+	container.addChild(new Text(theme.fg("muted", "─── Output preview ───"), 0, 0));
+	if (run.output) container.addChild(new Markdown(run.output.trim(), 0, 0, getMarkdownTheme()));
+	else container.addChild(new Text(theme.fg("muted", "(no output preview)"), 0, 0));
+	for (const line of artifactLines(run, theme)) container.addChild(new Text(line, 0, 0));
+	const usage = usageLine([run], undefined, theme);
+	if (usage) container.addChild(new Text(usage, 0, 0));
+	return container;
 }
 
 // ---------------------------------------------------------------------------
 // Task tool renderers (subagent_task_*)
 // ---------------------------------------------------------------------------
 
-export function renderTaskListResult(result: any, _options: { expanded: boolean }, theme: Theme): any {
-	const text = result.content[0];
-	return new Text(text?.type === "text" ? text.text : "(no tasks)", 0, 0);
+export function renderTaskListResult(result: any, _options: { expanded: boolean }, _theme: Theme): any {
+	return fallbackResult(result);
 }
 
 export function elapsed(startedAt: number, endedAt?: number): string {

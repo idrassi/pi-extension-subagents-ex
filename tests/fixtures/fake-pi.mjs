@@ -103,6 +103,11 @@ rl.on("line", async (line) => {
 			return;
 		}
 	}
+	if (scenario === "message-burst") {
+		for (let i = 0; i < 100; i++) record(assistant(`message-${i}`));
+		settle();
+		return;
+	}
 	if (scenario === "steer") {
 		record(assistant("working", 1, "toolUse"));
 		return;

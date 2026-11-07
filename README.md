@@ -131,9 +131,29 @@ All bundled agents inherit the parent session's model and thinking level by defa
 
 Top-level timeout, turn, cost, and retry options are defaults **per run**, not one aggregate limit for the whole parallel call or chain. The shared tree limits below bound aggregate work. Retries start a fresh child context with failure feedback in the same checkout; they are not a rollback and may repeat side effects. Use `resume` to deliberately continue an existing conversation.
 
-Bundled agents have no turn cap or total runtime deadline. A progress watchdog stops a child after **10 minutes without model or tool progress**, returning `timeout` with a stall reason. It starts when the child is prompted, so time in the admission queue does not count. Model streaming (including thinking), message boundaries, and tool execution updates reset it; stderr and unrelated RPC responses do not. Parents waiting in `subagent` or `subagent_task_output` rely on their descendants' watchdogs and restart their own watchdog after the tool returns. An explicit `timeout` still bounds the entire run, including those waits. Set `PI_SUBAGENTS_EX_STALL_TIMEOUT_MS` to adjust the idle window, including for tools that legitimately run silently for longer than ten minutes.
+Bundled agents have no turn cap or total runtime deadline. A progress watchdog stops a child after **10 minutes without model or tool progress**, returning `timeout` with a stall reason. It starts when the child is prompted, so time in the admission queue does not count. Model streaming (including thinking), message boundaries, and tool execution updates reset it; stderr and unrelated RPC responses do not. Parents waiting in `subagent` or `subagent_task_output` rely on their descendants' watchdogs and restart their own watchdog after the tool returns. Waiting for a managed model-request permit also pauses stall detection. An explicit `timeout` still bounds the entire run, including those waits. Set `PI_SUBAGENTS_EX_STALL_TIMEOUT_MS` to adjust the idle window, including for tools that legitimately run silently for longer than ten minutes.
 
-Every result includes model-visible run IDs, statuses, working directories, child session paths, usage, errors, and artifact references. Parallel results distinguish partial success. Failed orchestration and failed runs are flagged through pi's `tool_result` error hook while retaining structured details.
+Results publish compact run summaries, not transcripts. Exact run/tree/lineage IDs and all seven usage fields are preserved; output, task descriptions, errors, verification lists, and optional metadata can be shortened or omitted. Parallel results distinguish partial success. Failed orchestration and failed runs are flagged through pi's `tool_result` error hook while retaining structured details.
+
+## Bounded results and full output
+
+The serialized `{ content, details, usage }` result is limited to **64 KiB of UTF-8**, including JSON escaping. Model-facing text is at most **32 KiB and 1000 lines**; details have a **30 KiB** budget. A run's output preview is at most **4 KiB/160 lines**, and aggregate limits may shorten it further. Truncation is explicit. SDK usage totals are not clipped or recomputed. Exception results from these tools are bounded too.
+
+**JSON previews are not necessarily complete JSON documents.** Output contracts and chain placeholders still use complete internal run records. Successful settlement saves the full final text or parsed JSON to the run's `.output.txt` artifact; manifests and native sessions retain the larger evidence/transcript. Artifact paths are exact when included, never silently shortened into invalid references.
+
+Use the explicit, uncharged retrieval tools for larger output:
+
+```javascript
+subagent_history({ limit: 30 })
+// Follow details.nextCursor with { cursor: "...", limit: 30 }.
+
+subagent_run_output({ id: "run-<uuid>", offset: 0, limit: 4096 })
+// Follow details.nextOffset until absent. Offsets and limits are UTF-8 BYTES.
+```
+
+History defaults to 30 rows (maximum 50); it reads metadata, not v3 transcripts. Output pages contain at most 4096 bytes/900 output lines plus a header. Do not count JavaScript characters to calculate an offset: use `nextOffset`, which also handles Unicode and line-limited pages. Choose a byte limit large enough for the next complete UTF-8 character. Settled materialized output is read directly; live/interrupted/legacy or stale output falls back to explicit transcript reconstruction without locking or rewriting the run. Repeated changes during a live read can require a retry. Live pages are not a frozen transcript snapshot.
+
+Task/history pages can be smaller than the requested limit to fit escaped metadata. Follow the returned cursor rather than assuming a fixed number of rows.
 
 ## Background work, steering, and resume
 
@@ -151,7 +171,9 @@ subagent({ resume: "run-<uuid>", task: "Address the review feedback" })
 
 Use `runId` with `subagent_task_send` when a parallel task has multiple active workers. Steering is queued at pi's next steering boundary; it does not interrupt a running tool. Workers must have reached RPC prompt acceptance before they accept steering. A settled worker can be resumed instead.
 
-Progress includes live statuses, turns, and usage. Reading output repeatedly does not charge it again. Completion usage is attached once to the next persisted **tool result**, regardless of collection, or recorded in a child shutdown receipt. Assistant provider usage is never inflated with background tokens, so pi's context-size estimates remain unchanged. The task dashboard updates immediately; an idle parent's token/cost footer can remain behind until the next tool result is persisted. Notifications are queued into the current loop or the next user turn, and do not start an unsolicited new turn while idle.
+`subagent_task_list` returns result-free summaries and run IDs: default 10 tasks, maximum 20, with `cursor`/`nextCursor` pagination. `subagent_task_output` explicitly loads the selected compact result; use its run IDs with `subagent_run_output` for complete output. The dashboard also hydrates selected details only on demand.
+
+Progress includes live statuses, turns, and usage. Progress persistence and presentation are coalesced around 100 ms; lifecycle and final saves flush immediately. Reading output repeatedly does not charge it again. Completion usage is attached once to the next persisted **tool result**, regardless of collection, or recorded in a child shutdown receipt. Assistant provider usage is never inflated with background tokens, so pi's context-size estimates remain unchanged. The task dashboard reflects live usage with coalesced refreshes; an idle parent's token/cost footer can remain behind until the next tool result is persisted. Notifications are queued into the current loop or the next user turn, and do not start an unsolicited new turn while idle.
 
 Cancelling a collection wait leaves the background task running. Task cancellation stops its current workers. Session shutdown cancels all tasks and waits for cleanup. On POSIX, cancellation retains ownership of the process group after the RPC leader exits and escalates to SIGKILL before releasing its scheduler slot. Workers also monitor their dispatcher and retain a hard termination deadline through hanging shutdown hooks. Windows uses bounded `taskkill /T /F` while the leader is available; this is best-effort cleanup, not Job Object containment, and has not been verified on Windows.
 
@@ -159,13 +181,16 @@ Task snapshots survive reload/resume of the parent session. Managed workers use 
 
 ## Shared scheduling and budgets
 
-Foreground calls, background tasks, and nested workers share a process-safe queue and ledger for one parent pi session. Waiting parents yield their slots while descendants execute, then reacquire them before continuing. This avoids a deadlock when all available parents delegate. The limit controls active workers; parked parents remain live processes waiting for results.
+Foreground calls, background tasks, and nested workers share a process-safe queue and ledger for one parent pi session. There are independent limits for **executing workers, retained worker processes, queued admissions, and active model requests**. Waiting parents yield execution slots while descendants execute, then reacquire them before continuing; they retain their process reservations. Newly queued workers reserve no process until admitted. If the process cap leaves no room for a nested child, admission fails explicitly instead of deadlocking behind its parked parent.
 
 Set these variables before starting the parent session:
 
 | Variable | Default | Range / meaning |
 |---|---:|---|
-| `PI_SUBAGENTS_EX_CONCURRENCY` | 20 | 1–32 active workers |
+| `PI_SUBAGENTS_EX_CONCURRENCY` | 20 | 1–32 executing workers |
+| `PI_SUBAGENTS_EX_MAX_PROCESSES` | 64 | 1–256 retained worker-process reservations, including parked parents |
+| `PI_SUBAGENTS_EX_MAX_QUEUED` | 256 | 1–10,000 combined waiting worker/model-request admissions |
+| `PI_SUBAGENTS_EX_MAX_REQUESTS` | 20 | 1–128 active managed model-request operations |
 | `PI_SUBAGENTS_EX_MAX_RUNS` | unset | Optional 1–10,000 admitted runs, including resumed runs; queued requests consume an admission |
 | `PI_SUBAGENTS_EX_MAX_TOTAL_TURNS` | unset | Optional 1–100,000 child assistant turns |
 | `PI_SUBAGENTS_EX_MAX_COST` | unset | Positive observed USD ceiling for the tree |
@@ -173,11 +198,13 @@ Set these variables before starting the parent session:
 
 With no overrides, run and turn totals are tracked without a cumulative ceiling. These defaults follow Claude Code's documented [20-subagent concurrency and unlimited session spawn count](https://code.claude.com/docs/en/sub-agents#concurrent-subagent-limit) and [10-minute progress watchdog](https://code.claude.com/docs/en/env-vars). This extension queues work above its active-worker limit and accepts up to 32 tasks per parallel call.
 
-The first use fixes shared tree limits in the session's durable ledger; resuming that session retains its consumption and limits. **Existing sessions keep their saved limits**, including the former defaults of 4 workers, 128 runs, and 1000 turns. Start a new parent pi session to adopt the new defaults; reloading the extension or changing environment variables does not rewrite an existing ledger. `/agents-budget` displays the current totals and labels absent run/turn ceilings `unlimited`. These budgets cover delegated work, not the top-level interactive model's own requests. A mandatory child extension checks explicit turn limits even when ordinary extensions are disabled. Nested managed usage is counted once; retries and other usage-bearing tool results remain billable. In-flight requests and usage reported late can overshoot cost ceilings. Accounting depends on provider-reported usage and is not a billing-system hard cap.
+The first mutation fixes shared tree limits in the session's durable ledger; resuming that session retains its consumption and limits. **Existing sessions keep their saved limits**, including the former defaults of 4 workers, 128 runs, and 1000 turns. Old ledgers missing the three new resource limits receive their defaults without resetting consumption or accounting receipts. Start a new parent pi session to change saved limits; reloading the extension or changing environment variables does not rewrite them. `/agents-budget` displays worker, process, queue, request, run, turn, and cost totals and labels absent run/turn ceilings `unlimited`. These budgets cover delegated work, not the top-level interactive model's own requests. A mandatory child extension checks explicit turn limits even when ordinary extensions are disabled. Nested managed usage is counted once; retries and other usage-bearing tool results remain billable. In-flight requests and usage reported late can overshoot cost ceilings. Accounting depends on provider-reported usage and is not a billing-system hard cap.
 
 The shared ledger deduplicates each reported charge atomically across the child guard, RPC observer, and durable recovery. Every attempt exit reconciles flushed session messages and native `usage`, `compaction`, and `branch_summary` entries before applying any remaining statistics delta. The remainder is frozen at a recovered pre-shutdown checkpoint, so shutdown entries cannot hide a separate statistics-only charge. This relies on pi's supported persistence/shutdown ordering, not an atomic snapshot with arbitrary concurrent session writers. Historical entries in copied continuations are excluded. An incomplete final JSONL write is tolerated; other malformed records fail recovery rather than silently discarding usage. This cannot recover provider usage that was never reported or flushed.
 
-Delegation is available at depths 0–2; workers at depth 3 cannot delegate further. `extensions: false` also disables further delegation. Custom extensions that make their own model requests outside pi's normal turn/usage events are outside the turn guard's scope.
+Model-request reservations span stream consumption and provider retries, and are released before ordinary tools execute. Native compaction and branch summaries share the same cap. Child idle-cache warming is disabled because it has no usable assistant-completion boundary for permit release. A request-operation cap may conservatively retain a permit across native maintenance retries or sequential summary calls.
+
+Delegation is available at depths 0–2; workers at depth 3 cannot delegate further. `extensions: false` also disables further delegation. Custom extensions that make their own model requests outside the guarded ordinary/native events are outside these request/turn controls.
 
 ## Worktree and artifact handoff
 
@@ -239,17 +266,21 @@ State lives under `~/.pi/agent/subagents-ex/` (or the configured `PI_CODING_AGEN
 
 | Directory | Contents |
 |---|---|
-| `runs/` | Atomic snapshots: final outcome, all attempt messages and usage, diagnostics, metadata, bounded stderr |
+| `runs/` | v3 metadata checkpoints, append-only checksummed journals, task sidecars and settled output files; legacy v2 snapshots/backups |
 | `sessions/` | Native pi child sessions, one per attempt; used for resume |
 | `tasks/` | Background task snapshots, keyed by parent session and, for managed workers, run/attempt ownership |
 | `trees/` | Shared admission and budget ledgers |
 | `worktrees/` | Individual worktree records and live ownership |
 | `artifacts/` | Patches and command-evidence manifests |
 
-Run snapshots retain the newest 200 settled records. Active records are not pruned. Sessions, artifacts, task snapshots, and budget ledgers are retained until manually removed; they can contain source and tool output, so plan disk retention accordingly. Stderr is capped at 32 KB per attempt and final model-visible prose at 50 KB per run. No promise is made to recover bytes a child never flushed before forced termination.
+New saves use **v3 append-only journals with small atomic checkpoints**. Existing v2 snapshots remain readable; the first save migrates them after installing and verifying an exact `.v2-backup`. Incomplete final journal writes can recover the preceding committed state; interior corruption/checksum failures fail closed. History listing never replays a v3 journal or reads its task sidecar.
+
+Pruning normally retains the newest **200 settled v3 records**, coordinating checkpoint, journal, task, and output deletion. Active/busy records are skipped; legacy snapshots and migration backups are preserved, so 200 is not a hard directory/file-count bound. Sessions, artifacts, task snapshots, budget ledgers, and crash-orphaned files remain until manually removed. They can contain source and tool output; plan retention and back up complete run file sets rather than individual checkpoint JSON files.
+
+Run writes order file fsyncs, dependency publication, and atomic checkpoint rename; Linux directory-fsync failures fail the operation. Platforms without directory-sync support fall back to atomic-rename/process-crash safety, not guaranteed power-loss durability. Actual power-failure recovery has not been tested. Stderr remains capped at 32 KB per attempt. No promise is made to recover bytes a child never flushed before forced termination.
 
 ## Design and evaluation
 
-`plan.ts` normalizes and validates modes/options. `orchestrator.ts` executes all modes through the same `runner.ts` RPC engine. `scheduler.ts` coordinates processes; `child-guard.ts` enforces budgets inside pi. `tasks.ts`, `accounting.ts`, and `store.ts` handle background ownership, usage attribution, and persistence. `worktree.ts` exports patch handoffs. Presentation consumes these records through `render.ts` and `dashboard.ts`.
+`plan.ts` normalizes and validates modes/options. `orchestrator.ts` executes all modes through the same `runner.ts` RPC engine. `scheduler.ts` coordinates resources; `child-guard.ts` enforces budgets inside pi. `tasks.ts`, `accounting.ts`, and `store.ts` handle background ownership, usage attribution, and persistence. `results.ts` bounds publication DTOs; `history-tools.ts` exposes paginated reads. `worktree.ts` exports patch handoffs. Presentation consumes these records through `render.ts` and `dashboard.ts`.
 
 The [evaluation harness](benchmarks/README.md) compares direct work, the stock example, and this extension on repeatable fixtures, measuring task success, patch correctness, latency, tokens, and cost. Offline fixture checks and mocked integration tests establish mechanics. Live model comparisons are opt-in; no task-quality or cost advantage is claimed without those measurements.

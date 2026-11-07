@@ -18,6 +18,7 @@ test("dashboard emits physical lines within terminal width and scrolls selection
 		kind: "single",
 	}));
 	let closed = false;
+	let hydrations = 0;
 	const ctx = {
 		ui: {
 			custom: async (factory: Function) => {
@@ -33,7 +34,9 @@ test("dashboard emits physical lines within terminal width and scrolls selection
 					for (let i = 0; i < 20; i++) component.handleInput("\u001b[B");
 					const selected = component.render(100).find((line: string) => line.startsWith("›"));
 					assert.match(selected, /task-3/);
+					assert.equal(hydrations, 0, "routine list rendering must not hydrate saved task results");
 					component.handleInput("\r");
+					assert.equal(hydrations, 1, "opening a task explicitly hydrates its compact saved result");
 					for (const line of component.render(12)) {
 						assert.ok(!line.includes("\n"));
 						assert.ok(visibleWidth(line) <= 12);
@@ -45,7 +48,10 @@ test("dashboard emits physical lines within terminal width and scrolls selection
 			},
 		},
 	};
-	await openDashboard(ctx as any, { list: () => [...tasks], runningCount: () => tasks.length } as any, () => []);
+	await openDashboard(ctx as any, {
+		list: () => [...tasks], runningCount: () => tasks.length,
+		get: (id: string) => { hydrations++; return tasks.find((task) => task.id === id); },
+	} as any, () => []);
 	assert.ok(closed);
 });
 

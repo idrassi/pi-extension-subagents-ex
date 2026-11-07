@@ -1,0 +1,15 @@
+{
+  "id": "legacy-tree",
+  "limits": { "concurrency": 1, "maxRuns": 128, "maxTurns": 1000, "maxCost": 2 },
+  "runs": 12,
+  "turns": 30,
+  "cost": 0.75,
+  "sequence": 12,
+  "leases": [],
+  "usageByRun": {
+    "legacy-run": {
+      "usage": { "input": 30, "output": 20, "cacheRead": 0, "cacheWrite": 0, "cost": 0.75, "contextTokens": 50, "turns": 1 },
+      "usageEvents": { "legacy-event": true }
+    }
+  }
+}

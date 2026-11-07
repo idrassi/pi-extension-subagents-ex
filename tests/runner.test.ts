@@ -30,6 +30,21 @@ test("RPC recovery clears transient errors, ignores intermediate agent_end, and 
 	assert.ok(Math.abs(run.usage.cost - 0.3) < 1e-9);
 });
 
+test("streaming checkpoints and observers coalesce bursts but settlement retains every message", { timeout: 15000 }, async () => {
+	const runner = runnerFor("message-burst");
+	let updates = 0;
+	const run = await runner.run(defaults, agent, "test", {}, undefined, undefined, () => { updates++; });
+	assert.equal(run.status, "ok", run.errorMessage);
+	assert.equal(run.messages.length, 100);
+	assert.equal(loadRunById(run.id)?.messages.length, 100);
+	assert.ok(updates < 80, `expected fewer observers than messages, got ${updates}`);
+	assert.equal(fs.readFileSync(run.artifacts!.output!, "utf8"), "message-99");
+	const settledUpdates = updates;
+	await delay(160);
+	assert.equal(updates, settledUpdates, "no delayed progress snapshot after settlement");
+	assert.deepEqual((await runner.scheduler.snapshot()).leases, []);
+});
+
 test("schema retries retain each transcript and all billed usage", async () => {
 	const run = await runnerFor("retry").run(defaults, agent, "answer", {
 		retries: 1,

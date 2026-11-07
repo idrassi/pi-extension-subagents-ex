@@ -5,6 +5,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 export default function mockProvider(pi: ExtensionAPI) {
+	let requestSequence = 0;
 	pi.registerTool({
 		name: "fixture_wrap",
 		label: "Nested fixture",
@@ -53,6 +54,8 @@ export default function mockProvider(pi: ExtensionAPI) {
 		},
 	});
 	let nativeFixture = false;
+	let abortNative: (() => void) | undefined;
+	pi.on("session_before_compact", (_event, ctx) => { abortNative = () => { void ctx.abort(); }; });
 	pi.on("before_agent_start", (event) => {
 		nativeFixture = "prompt" in event && event.prompt.includes("COMPACT_THEN_HANG");
 	});
@@ -87,6 +90,10 @@ export default function mockProvider(pi: ExtensionAPI) {
 				maxTokens: 1000,
 			},
 			{
+				id: "fixture-compact", name: "Local compaction fixture", reasoning: false, input: ["text"],
+				cost: { input: 1, output: 1, cacheRead: 0, cacheWrite: 0 }, contextWindow: 32000, maxTokens: 1000,
+			},
+			{
 				id: "fixture-reasoning",
 				name: "Local reasoning fixture",
 				reasoning: true,
@@ -107,7 +114,19 @@ export default function mockProvider(pi: ExtensionAPI) {
 			},
 		],
 		streamSimple(model, context, options) {
+			const summary = context.messages.some((message) => message.role === "system" &&
+				(typeof message.content === "string" ? message.content : message.content.map((part) => part.text).join("\n"))
+					.startsWith("You are a context summarization assistant"));
 			const stream = createAssistantMessageEventStream();
+			const requestId = `${process.pid}-${requestSequence++}`;
+			const requestLog = (phase: string, outcome?: string) => {
+				if (process.env.SUBAGENTS_TEST_REQUEST_LOG)
+					fs.appendFileSync(process.env.SUBAGENTS_TEST_REQUEST_LOG, `${JSON.stringify({
+						requestId, phase, kind: summary ? "summary" : "assistant", ...(outcome ? { outcome } : {}),
+						treeId: process.env.PI_SUBAGENTS_EX_TREE_ID, timestamp: Date.now(),
+					})}\n`);
+			};
+			requestLog("start");
 			const user = context.messages.filter((m) => m.role === "user").at(-1);
 			const prompt =
 				typeof user?.content === "string"
@@ -135,7 +154,7 @@ export default function mockProvider(pi: ExtensionAPI) {
 			const collected = prompt.includes("COLLECT_WRAPPED_DELEGATE");
 			const delegateTool = collected ? "fixture_collect" : wrapped ? "fixture_wrap" : "subagent";
 			const delegate =
-				prompt.includes("DELEGATE") &&
+				!summary && prompt.includes("DELEGATE") &&
 				!context.messages.some((m) => m.role === "toolResult" && m.toolName === delegateTool);
 			const message: AssistantMessage = {
 				role: "assistant",
@@ -170,30 +189,44 @@ export default function mockProvider(pi: ExtensionAPI) {
 							]
 						: [{ type: "text", text: `fixture complete; history=${context.messages.length}` }],
 				usage: {
-					input: 10,
+					input: model.id === "fixture-compact" && !summary ? 64000 : 10,
 					output: 5,
 					cacheRead: 0,
 					cacheWrite: 0,
-					totalTokens: 15,
+					totalTokens: model.id === "fixture-compact" && !summary ? 64005 : 15,
 					cost: { input: 0.005, output: 0.005, cacheRead: 0, cacheWrite: 0, total: 0.01 },
 				},
 				stopReason: looping || delegate ? "toolUse" : "stop",
 				timestamp: Date.now(),
 			};
 			const finish = () => {
+				requestLog("end");
 				stream.push({ type: "start", partial: message });
 				stream.push({ type: "done", reason: message.stopReason as "stop" | "toolUse", message });
 				stream.end();
 			};
-			if (prompt.includes("STREAM_PROGRESS")) {
+			if (summary || prompt.includes("STREAM_PROGRESS")) {
 				void (async () => {
 					stream.push({ type: "start", partial: message });
 					stream.push({ type: "text_start", contentIndex: 0, partial: message });
-					for (let i = 0; i < 12; i++) {
+					for (let i = 0; i < (prompt.includes("STREAM_PROGRESS_LONG") ? 24 : 12); i++) {
 						await new Promise((r) => setTimeout(r, 75));
+						if (summary && prompt.includes("NATIVE_SUMMARY_ABORT") && i === 6) abortNative?.();
+						if (options?.signal?.aborted) {
+							message.stopReason = "aborted";
+							requestLog("end", "aborted");
+							stream.push({ type: "error", reason: "aborted", error: message });
+							stream.end();
+							return;
+						}
 						stream.push({ type: "text_delta", contentIndex: 0, delta: ".", partial: message });
 					}
-					stream.push({ type: "done", reason: "stop", message });
+					if (summary && prompt.includes("NATIVE_SUMMARY_FAIL")) {
+						message.stopReason = "error";
+						message.errorMessage = "Local summary failure";
+						stream.push({ type: "error", reason: "error", error: message });
+					} else stream.push({ type: "done", reason: "stop", message });
+					requestLog("end", message.stopReason);
 					stream.end();
 				})();
 			} else if (background && !delegate) {

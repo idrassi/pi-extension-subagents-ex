@@ -8,7 +8,9 @@ import { Type } from "typebox";
 import { BUNDLED_PROMPTS_DIR, discoverAgents, type AgentScope } from "./agents.ts";
 import { UsageLedger } from "./accounting.ts";
 import { openDashboard } from "./dashboard.ts";
-import { formatDuration, formatUsageStats } from "./format.ts";
+import { formatDuration, formatUsageStats, truncateToBytes } from "./format.ts";
+import { registerHistoryTools } from "./history-tools.ts";
+import { boundedResult } from "./results.ts";
 import { buildPlan, type PlanInput } from "./plan.ts";
 import { ProjectAgentTrust } from "./project-agent-trust.ts";
 import { executePlan } from "./orchestrator.ts";
@@ -23,7 +25,7 @@ import {
 	unregisterWorktree,
 	worktreeIsActive,
 } from "./store.ts";
-import { TaskManager, serializeTask, waitForTask } from "./tasks.ts";
+import { TaskManager, taskSummary, waitForTask } from "./tasks.ts";
 import type { SubagentDetails } from "./types.ts";
 import { MAX_CHAIN_STEPS, MAX_PARALLEL_TASKS, MAX_RETRIES, MAX_TIMEOUT_SECONDS, numberControl } from "./validation.ts";
 import { removeWorktree } from "./worktree.ts";
@@ -115,14 +117,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	let closing = false;
 	let widgetTimer: NodeJS.Timeout | undefined;
 	const projectAgentTrust = new ProjectAgentTrust();
+	registerHistoryTools(pi);
+	let widgetUpdatedAt = 0;
 
 	const updateWidget = () => {
-		if (closing || !lastCtx?.hasUI || !tasks) return;
+		if (closing || !lastCtx?.hasUI || !tasks || Date.now() - widgetUpdatedAt < 100) return;
+		widgetUpdatedAt = Date.now();
 		const active = tasks.list().filter((t) => !t.endedAt);
 		lastCtx.ui.setWidget(
 			"subagents-ex",
 			active.length
-				? active.map(
+				? active.slice(0, 8).map(
 						(t) =>
 							`${t.id.slice(0, 13)} · ${t.status} · ${t.label} · ${formatDuration(Date.now() - t.startedAt)} · $${t.usage.cost.toFixed(4)}`,
 					)
@@ -143,6 +148,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		const id = ctx.sessionManager.getSessionId();
 		if (sessionId === id) return;
 		closing = false;
+		widgetUpdatedAt = 0;
 		tasks = new TaskManager(id);
 		ledger = new UsageLedger();
 		runner = new Runner({
@@ -182,6 +188,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	});
 	pi.on("tool_result", (event) => {
 		if (!event.toolName.startsWith("subagent")) return;
+		if (event.isError && ["subagent", "subagent_task_list", "subagent_task_output", "subagent_task_send", "subagent_task_kill", "subagent_history", "subagent_run_output"].includes(event.toolName)) {
+			// SDK-generated exceptions also cross the publication boundary. An
+			// unknown task/run identifier can otherwise amplify an error result.
+			const text = event.content.filter((part) => part.type === "text").map((part) => part.text).join("\n");
+			return { ...boundedResult(text, event.details ?? {}, event.usage), isError: true };
+		}
 		const details = event.details as { status?: string; task?: { status?: string } } | undefined;
 		const status = details?.status ?? details?.task?.status;
 		if (status && ["error", "aborted", "killed", "interrupted"].includes(status)) return { isError: true };
@@ -203,6 +215,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			"Provide acceptance criteria and necessary context. Use parallel mode for independent tasks and chains for dependencies.",
 			"Use worktree isolation for parallel coding. Review the returned patch and verification evidence before applying it.",
 			"Background tasks can be steered with subagent_task_send. Collect their results before declaring their work complete.",
+			"Routine results are compact and bounded. Use subagent_history and subagent_run_output for saved history and full output pages.",
 			"Resume a saved run using subagent({resume: runId, task: followUp}); costs are new work and share the session budget.",
 			"Project agents require per-definition session confirmation, even with pi project trust; unapproved headless use is disabled. Use agentScope both to select them.",
 			"Available agents:",
@@ -215,7 +228,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		name: "subagent",
 		label: "Subagent",
 		description:
-			"Execute specialist agents as a single task, parallel tasks, or a sequential chain. Supports background work, worktrees with patch artifacts, budgets, validated JSON, and resuming a saved run. Project definitions require per-definition session confirmation even with pi project trust; unapproved headless use is disabled. Returns run ids, output, artifacts, and usage.",
+			"Execute specialist agents as a single task, parallel tasks, or a sequential chain. Supports background work, worktrees with patch artifacts, budgets, validated JSON, and resuming a saved run. Project definitions require per-definition session confirmation even with pi project trust; unapproved headless use is disabled. Returns compact run summaries, output previews, artifacts, and usage (64 KiB serialized result, 32 KiB/1000 text lines). Use subagent_run_output for full output pages.",
 		promptSnippet: "Run specialist agents (single, parallel, chain, background, resume)",
 		parameters: Params,
 		prepareArguments(args) {
@@ -253,17 +266,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					if (!fs.statSync(step.overrides.cwd!).isDirectory())
 						throw new Error(`Invalid working directory: ${step.overrides.cwd}`);
 			} catch (err) {
-				return {
-					content: [{ type: "text", text: err instanceof Error ? err.message : String(err) }],
-					details: {
+				return boundedResult(err instanceof Error ? err.message : String(err), {
 						mode: "single",
 						agentScope: params.agentScope ?? "user",
 						projectAgentsDir: null,
 						results: [],
 						status: "error",
-						errorMessage: String(err),
-					} satisfies SubagentDetails,
-				};
+						errorMessage: truncateToBytes(String(err), 512).text,
+					} satisfies SubagentDetails);
 			}
 			const executionPlan = plan;
 			if (params.runInBackground) {
@@ -278,14 +288,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 						}),
 				);
 				updateWidget();
-				return {
-					content: [
-						{
-							type: "text",
-							text: `Queued ${task.id} (${task.label}). Collect with subagent_task_output; steer with subagent_task_send.`,
-						},
-					],
-					details: {
+				return boundedResult(`Queued ${task.id} (${task.label}). Collect with subagent_task_output; steer with subagent_task_send.`, {
 						mode: "background",
 						agentScope: plan.agentScope,
 						projectAgentsDir: plan.projectAgentsDir,
@@ -293,8 +296,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 						status: "running",
 						taskId: task.id,
 						notify: task.notify,
-					} satisfies SubagentDetails,
-				};
+					} satisfies SubagentDetails);
 			}
 			return runner.scheduler.whileWaiting(() => executePlan(executionPlan, runner, signal, onUpdate), signal);
 		},
@@ -306,26 +308,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		name: "subagent_task_list",
 		label: "Subagent Task List",
 		description:
-			"List this session's background tasks, including recovered snapshots, current progress, usage, and run ids.",
-		parameters: Type.Object({}),
-		async execute(_id, _params, _signal, _update, ctx) {
+			"List compact background task summaries, usage and run ids without result bodies. Cursor-paginated, default 10 and maximum 20 tasks per page.",
+		parameters: Type.Object({ cursor: Type.Optional(Type.String({ maxLength: 1024 })),
+			limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })) }),
+		async execute(_id, rawParams, _signal, _update, ctx) {
 			ensureSession(ctx);
-			return {
-				content: [
-					{
-						type: "text",
-						text:
-							tasks
-								.list()
-								.map(
-									(t) =>
-										`${t.id} ${t.status} — ${t.label} — ${formatUsageStats(t.usage)} — ${t.summary}\nRuns: ${t.result?.details.results.map((r) => `${r.id} (${r.status})`).join(", ") || "queued"}`,
-								)
-								.join("\n") || "No background tasks in this session.",
-					},
-				],
-				details: { tasks: tasks.list().map(serializeTask) },
-			};
+			const params = rawParams as { cursor?: string; limit?: number };
+			let limit = numberControl(params.limit ?? 10, "limit", 1, 20, true)!;
+			let page = tasks.page({ ...params, limit });
+			let summaries = page.tasks.map(taskSummary);
+			while (Buffer.byteLength(JSON.stringify({ tasks: summaries, nextCursor: page.nextCursor })) > 24 * 1024 && limit > 1) {
+				limit = Math.max(1, Math.floor(limit / 2));
+				page = tasks.page({ ...params, limit });
+				summaries = page.tasks.map(taskSummary);
+			}
+			return boundedResult(summaries.map((task) =>
+				`${task.id} ${task.status} — ${task.label} — ${formatUsageStats(task.usage)} — ${task.summary}\nRuns: ${task.runIds.join(", ") || "queued"}`
+			).join("\n") || "No background tasks in this session.", { tasks: summaries, nextCursor: page.nextCursor });
 		},
 		renderResult: renderTaskListResult,
 	});
@@ -350,15 +349,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				.filter((c) => c.type === "text")
 				.map((c) => c.text)
 				.join("\n");
-			return {
-				content: [
-					{
-						type: "text",
-						text: `${task.id} ${task.status} — ${task.label}\n${formatUsageStats(task.usage)}\n${task.endedAt ? text || task.errorMessage || task.summary : task.summary}`,
-					},
-				],
-				details: { task: serializeTask(task), results: task.result?.details.results },
-			};
+			return boundedResult(`${task.id} ${task.status} — ${taskSummary(task).label}\n${formatUsageStats(task.usage)}\n${task.endedAt ? text || task.errorMessage || task.summary : task.summary}`,
+				{ task: taskSummary(task), results: task.result?.details.results });
 		},
 		renderResult: renderTaskListResult,
 	});
@@ -382,7 +374,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			if (!target || !ids.includes(target))
 				throw new Error(`Select one active runId: ${ids.join(", ") || "none accepting steering yet"}`);
 			await runner.steer(target, params.message);
-			return { content: [{ type: "text", text: `Instruction queued for ${target}.` }], details: { runId: target } };
+			return boundedResult(`Instruction queued for ${target}.`, { runId: target });
 		},
 	});
 	pi.registerTool({
@@ -392,17 +384,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		parameters: Type.Object({ id: Type.String() }),
 		async execute(_id, params, _signal, _update, ctx) {
 			ensureSession(ctx);
-			return {
-				content: [
-					{
-						type: "text",
-						text: tasks.kill(params.id)
-							? `Cancellation requested for ${params.id}.`
-							: `${params.id} is unknown or already settled.`,
-					},
-				],
-				details: {},
-			};
+			return boundedResult(tasks.kill(params.id) ? `Cancellation requested for ${params.id}.` : `${params.id} is unknown or already settled.`, {});
 		},
 		renderResult: renderTaskListResult,
 	});
@@ -436,12 +418,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		},
 	});
 	pi.registerCommand("agents-budget", {
-		description: "Show shared agent-tree concurrency, turn, run, and cost budgets",
+		description: "Show shared worker, process, queue, model-request, turn, run, and cost limits",
 		handler: async (_args, ctx) => {
 			ensureSession(ctx);
 			const state = await runner.scheduler.snapshot();
 			ctx.ui.notify(
-				`Agent tree: ${state.leases.filter((l) => l.active).length}/${state.limits.concurrency} active, ${state.runs}/${state.limits.maxRuns ?? "unlimited"} runs, ${state.turns}/${state.limits.maxTurns ?? "unlimited"} turns, $${state.cost.toFixed(4)}${state.limits.maxCost ? `/$${state.limits.maxCost}` : ""}`,
+				`Agent tree: ${state.leases.filter((l) => l.active).length}/${state.limits.concurrency} active, ${state.runs}/${state.limits.maxRuns ?? "unlimited"} runs, ${state.turns}/${state.limits.maxTurns ?? "unlimited"} turns, $${state.cost.toFixed(4)}${state.limits.maxCost ? `/$${state.limits.maxCost}` : ""}; ${state.leases.filter((l) => l.processReserved).length}/${state.limits.maxProcesses} process slots, ${state.leases.filter((l) => !l.processReserved).length + state.requests.filter((r) => !r.active).length}/${state.limits.maxQueued} queued, ${state.requests.filter((r) => r.active).length}/${state.limits.maxRequests} model requests`,
 				"info",
 			);
 		},

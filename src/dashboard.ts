@@ -147,7 +147,7 @@ export async function openDashboard(
 				if (!row) return;
 				if (row.kind === "task" && row.task) {
 					detailTitle = row.task.id;
-					detailLines = taskDetail(row.task);
+					detailLines = taskDetail(tasks.get(row.task.id) ?? row.task);
 				} else if (row.kind === "run" && row.run) {
 					detailTitle = row.run.id;
 					detailLines = runDetail(row.run);

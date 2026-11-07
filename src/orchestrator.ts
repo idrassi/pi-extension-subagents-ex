@@ -6,47 +6,29 @@ import type { ExecutionPlan } from "./plan.ts";
 import { expandTask } from "./plan.ts";
 import { Runner, mapWithConcurrencyLimit } from "./runner.ts";
 import { claimWorktree, registerWorktree } from "./store.ts";
-import { aggregateUsage, getResultOutput, toModelUsage, truncateToBytes } from "./format.ts";
+import { aggregateUsage, toModelUsage } from "./format.ts";
+import { boundedResult, compactDetails } from "./results.ts";
 import { newRunRecord, type RunRecord, type SubagentDetails, type WorktreeInfo } from "./types.ts";
 import { createWorktree } from "./worktree.ts";
 
 export function resultFor(details: SubagentDetails): AgentToolResult<SubagentDetails> {
-	const outputs = details.results.map((r) => {
-		const output = r.parsedOutput === undefined ? getResultOutput(r) : JSON.stringify(r.parsedOutput, null, 2);
-		const clipped = truncateToBytes(output, 50 * 1024);
-		const artifact = r.artifacts
-			? {
-					...r.artifacts,
-					changedFiles: r.artifacts.changedFiles.slice(0, 100),
-					verification: r.artifacts.verification
-						.slice(-10)
-						.map((v) => ({ command: truncateToBytes(v.command, 1024).text, exitCode: v.exitCode, isError: v.isError })),
-					changedFileCount: r.artifacts.changedFiles.length,
-					commandCount: r.artifacts.verification.length,
-				}
-			: undefined;
-		const metadata = {
-			runId: r.id,
-			status: r.status,
-			cwd: r.cwd,
-			sessionFile: r.sessionFile,
-			worktree: r.worktree,
-			artifacts: artifact,
-			usage: r.usage,
-			error: r.errorMessage,
-		};
-		return `### ${r.agent}: ${r.status}\n${clipped.text}${clipped.truncated ? "\n[Output truncated; full output is in the saved run.]" : ""}\n\nRun metadata:\n${JSON.stringify(metadata, null, 2)}`;
+	const published = compactDetails(details);
+	const outputs = published.results.map((run) => {
+		const refs = [
+			`Run: ${run.id}${run.treeId ? ` (tree ${run.treeId})` : ""}`,
+			...(["output", "manifest", "patch"] as const).flatMap((key) =>
+				run.artifacts?.[key] ? [`${key}: ${run.artifacts[key]}`] : [],
+			),
+			...(run.sessionFile ? [`session: ${run.sessionFile}`] : []),
+			...(run.cwd ? [`cwd: ${run.cwd}`] : []),
+		];
+		return `### ${run.agent}: ${run.status}\n${run.output ?? "(no output preview)"}${run.errorMessage && run.status !== "ok" ? `\nError: ${run.errorMessage}` : ""}\n\n${refs.join("\n")}`;
 	});
-	return {
-		content: [
-			{
-				type: "text",
-				text: `${details.mode}: ${details.status ?? "running"}${details.errorMessage ? ` — ${details.errorMessage}` : ""}\n\n${outputs.join("\n\n")}`,
-			},
-		],
-		details,
-		usage: toModelUsage(aggregateUsage(details.results)),
-	};
+	return boundedResult(
+		`${published.mode}: ${published.status ?? "running"}${published.errorMessage ? ` — ${published.errorMessage}` : ""}\n\n${outputs.join("\n\n")}\n\nFull output: subagent_run_output with a run ID; previews are not output contracts.`,
+		published,
+		toModelUsage(aggregateUsage(details.results)),
+	);
 }
 
 export async function executePlan(
@@ -55,7 +37,9 @@ export async function executePlan(
 	signal?: AbortSignal,
 	onUpdate?: (result: AgentToolResult<SubagentDetails>) => void,
 ): Promise<AgentToolResult<SubagentDetails>> {
-	const details: SubagentDetails = {
+	// Execution state stays full fidelity for chain placeholders and contracts.
+	// Only resultFor/onUpdate publication projects records to compact DTOs.
+	const details: Omit<SubagentDetails, "results"> & { results: RunRecord[] } = {
 		mode: plan.mode,
 		agentScope: plan.agentScope,
 		projectAgentsDir: plan.projectAgentsDir,

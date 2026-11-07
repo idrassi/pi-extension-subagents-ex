@@ -9,7 +9,7 @@ import { getPackageDir } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "./agents.ts";
 import { validateOutput, validateOutputSchema } from "./contracts.ts";
 import { aggregateUsage, getFinalOutput, truncateToBytes } from "./format.ts";
-import { ARTIFACTS_DIR, SESSIONS_DIR, claimWorktree, registerWorktree, saveRun } from "./store.ts";
+import { ARTIFACTS_DIR, SESSIONS_DIR, claimWorktree, registerWorktree, runOutputFile, saveRun } from "./store.ts";
 import { BudgetError, Scheduler } from "./scheduler.ts";
 import {
 	emptyUsage,
@@ -128,6 +128,28 @@ export class Runner {
 	private options: RunnerOptions;
 	private readonly stallTimeoutMs: number;
 	private active = new Map<string, (message: string) => Promise<void>>();
+	private budgetWatchers = new Set<(reason: string) => void>();
+	private budgetTimer?: NodeJS.Timeout;
+	private budgetChecking = false;
+	private watchBudget(listener: (reason: string) => void): () => void {
+		this.budgetWatchers.add(listener);
+		this.budgetTimer ??= setInterval(() => {
+			if (this.budgetChecking) return;
+			this.budgetChecking = true;
+			void this.scheduler.budgetReason().then((reason) => {
+				if (reason) for (const watcher of this.budgetWatchers) watcher(reason);
+			}, (err) => {
+				for (const watcher of this.budgetWatchers) watcher(`Budget ledger unavailable: ${String(err)}`);
+			}).finally(() => { this.budgetChecking = false; });
+		}, 250);
+		return () => {
+			this.budgetWatchers.delete(listener);
+			if (!this.budgetWatchers.size && this.budgetTimer) {
+				clearInterval(this.budgetTimer);
+				this.budgetTimer = undefined;
+			}
+		};
+	}
 	constructor(options: RunnerOptions = {}) {
 		this.options = options;
 		this.scheduler = options.scheduler ?? new Scheduler();
@@ -191,12 +213,29 @@ export class Runner {
 		let releaseSlot: (() => Promise<void>) | undefined;
 		let releaseWorktree: (() => Promise<void>) | undefined;
 		let workspaceReady = false;
-		const update = () => {
+		let progressTimer: NodeJS.Timeout | undefined;
+		let progressSavedAt = 0;
+		const persist = () => {
+			progressSavedAt = Date.now();
 			saveRun(record);
 			try {
 				onUpdate?.(record);
 			} catch {
 				/* presentation observers do not own execution */
+			}
+		};
+		const update = (immediate = true) => {
+			if (immediate || Date.now() - progressSavedAt >= 100) {
+				if (progressTimer) clearTimeout(progressTimer);
+				progressTimer = undefined;
+				persist();
+			} else if (!progressTimer) {
+				progressTimer = setTimeout(() => {
+					progressTimer = undefined;
+					try { persist(); }
+					catch (err) { controller.abort(new RunStop("error", `Run persistence failed: ${String(err)}`)); }
+				}, 100 - (Date.now() - progressSavedAt));
+				progressTimer.unref();
 			}
 		};
 		try {
@@ -394,6 +433,7 @@ export class Runner {
 					record.artifacts = await exportPatch(record.worktree, record.id);
 				record.artifacts ??= { changedFiles: [], verification: [] };
 				record.artifacts.verification = verification(record.attemptHistory.flatMap((a) => a.messages));
+				record.artifacts.output = runOutputFile(record.id);
 				record.artifacts.manifest = path.join(ARTIFACTS_DIR, `${record.id}.json`);
 				writeJson(record.artifacts.manifest, { runId: record.id, ...record.artifacts });
 			} catch (err) {
@@ -442,7 +482,7 @@ export class Runner {
 		options: RunOverrides,
 		prompt: string,
 		signal: AbortSignal,
-		update: () => void,
+		update: (immediate?: boolean) => void,
 		accounting: AttemptAccounting,
 	): Promise<void> {
 		return new Promise((resolve) => {
@@ -493,6 +533,8 @@ export class Runner {
 			let exitDrain: NodeJS.Timeout | undefined;
 			let stallTimer: NodeJS.Timeout | undefined;
 			let watchingProgress = false;
+			let waitingForRequest = false;
+			let unsubscribeBudget = () => {};
 			const waitingForSubagents = new Set<string>();
 			let requestId = 0;
 			const provenance = new ManagedUsageTracker();
@@ -575,7 +617,7 @@ export class Runner {
 				armEscalation();
 			};
 			const noteProgress = () => {
-				if (!watchingProgress || stopping || finished || leaderExited || settled || waitingForSubagents.size) return;
+				if (!watchingProgress || stopping || finished || leaderExited || settled || waitingForRequest || waitingForSubagents.size) return;
 				if (stallTimer) stallTimer.refresh();
 				else
 					stallTimer = setTimeout(
@@ -618,7 +660,7 @@ export class Runner {
 				proc.stdout.destroy();
 				proc.stderr.destroy();
 				clearStallTimer();
-				clearInterval(budgetTimer);
+				unsubscribeBudget();
 				signal.removeEventListener("abort", onAbort);
 				this.active.delete(record.id);
 				for (const req of pending.values()) {
@@ -662,7 +704,7 @@ export class Runner {
 				if (event.type === "agent_end") provenance.clear();
 				if (event.type === "entry_appended" || event.type === "compaction_end") {
 					await accounting.recover();
-					update();
+					update(false);
 					if (!settled && options.maxCost !== undefined && record.usage.cost >= options.maxCost)
 						stop(new RunStop("budget", `Run cost budget reached ($${options.maxCost})`));
 				}
@@ -677,7 +719,7 @@ export class Runner {
 						if (msg.errorMessage) attempt.diagnostics.push(msg.errorMessage);
 					}
 					record.usage = aggregateUsage(record.attemptHistory!);
-					update();
+					update(false);
 					if (options.maxCost !== undefined && record.usage.cost >= options.maxCost && attempt.stopReason === "toolUse")
 						stop(new RunStop("budget", `Run cost budget reached ($${options.maxCost})`));
 					if (options.maxTurns !== undefined && record.usage.turns > options.maxTurns)
@@ -702,6 +744,11 @@ export class Runner {
 				}
 				// Observe actual events on arrival, before asynchronous accounting can delay delivery.
 				// RPC responses, stderr, and unrelated notifications are not evidence of progress.
+				if (event.type === "entry_appended" && event.entry?.customType === "subagents-ex-request-wait") {
+					waitingForRequest = event.entry.data?.waiting === true;
+					if (waitingForRequest) clearStallTimer();
+					else noteProgress();
+				}
 				if (event.type === "agent_settled") {
 					watchingProgress = false;
 					clearStallTimer();
@@ -801,22 +848,9 @@ export class Runner {
 			const onAbort = () => stop(stopFromSignal(signal));
 			if (signal.aborted) onAbort();
 			else signal.addEventListener("abort", onAbort, { once: true });
-			let checkingBudget = false;
-			const budgetTimer = setInterval(() => {
-				if (checkingBudget || finished || settled) return;
-				checkingBudget = true;
-				void this.scheduler
-					.budgetReason()
-					.then(
-						(reason) => {
-							if (reason) stop(new RunStop("budget", reason));
-						},
-						(err) => stop(new RunStop("budget", `Budget ledger unavailable: ${String(err)}`)),
-					)
-					.finally(() => {
-						checkingBudget = false;
-					});
-			}, 250);
+			unsubscribeBudget = this.watchBudget((reason) => {
+				if (!finished && !settled) stop(new RunStop("budget", reason));
+			});
 			void (async () => {
 				update(); // Persist child ownership before admitting a model request.
 				const commands = await request("get_commands");

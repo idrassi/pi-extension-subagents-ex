@@ -50,6 +50,8 @@ export interface VerificationEvidence {
 export interface RunArtifacts {
 	manifest?: string;
 	patch?: string;
+	/** Optional settled final-output file; never rewritten for progress previews. */
+	output?: string;
 	changedFiles: string[];
 	baseCommit?: string;
 	verification: VerificationEvidence[];
@@ -109,11 +111,59 @@ export interface RunRecord {
 	outputSchema?: Record<string, unknown>;
 }
 
+/** References and short metadata only; verification transcripts stay in the saved run. */
+export interface RunResultArtifacts {
+	manifest?: string;
+	patch?: string;
+	output?: string;
+	baseCommit?: string;
+	changedFiles?: string[];
+	changedFileCount?: number;
+	verification?: Omit<VerificationEvidence, "output">[];
+	commandCount?: number;
+}
+
+/**
+ * Published run DTO. This is deliberately not a transcript or a resumable run.
+ * Optional preview/metadata fields keep legacy RunRecord fixtures assignable.
+ * Identity, lineage and all seven usage fields must survive every publication.
+ */
+export interface RunResult {
+	id: string;
+	agent: string;
+	agentSource: AgentSource;
+	status: RunStatus;
+	attempts: number;
+	startedAt: number;
+	usage: UsageStats;
+	treeId?: string;
+	parentRunId?: string;
+	resumeOf?: string;
+	step?: number;
+	endedAt?: number;
+	exitCode?: number;
+	task?: string;
+	cwd?: string;
+	model?: string;
+	stopReason?: string;
+	errorMessage?: string;
+	sessionFile?: string;
+	worktree?: WorktreeInfo;
+	artifacts?: RunResultArtifacts;
+	/** Bounded text preview, not necessarily a complete/valid JSON document. */
+	output?: string;
+	outputBytes?: number;
+	outputTruncated?: boolean;
+	metadataTruncated?: boolean;
+}
+
 export interface SubagentDetails {
 	mode: RunMode | "background";
 	agentScope: string;
 	projectAgentsDir: string | null;
-	results: RunRecord[];
+	results: RunResult[];
+	/** Some preview/metadata was omitted; exact run identities and usage remain. */
+	truncated?: boolean;
 	/** Background task id (mode === "background"). */
 	taskId?: string;
 	notify?: boolean;
@@ -175,6 +225,6 @@ export function newRunRecord(
 	};
 }
 
-export function isRunFailed(record: RunRecord): boolean {
+export function isRunFailed(record: Pick<RunResult, "status">): boolean {
 	return record.status !== "ok" && record.status !== "running" && record.status !== "queued";
 }

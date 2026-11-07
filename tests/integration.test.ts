@@ -164,7 +164,7 @@ test("real turn guard prevents the third provider call and captures bash evidenc
 	const run = await runnerFor().run(defaults, worker, "LOOP_TOOLS", { maxTurns: 2, timeoutSeconds: 10 });
 	assert.equal(run.status, "max-turns", `${run.errorMessage}\n${run.stderr}`);
 	assert.equal(calls() - before, 2);
-	assert.equal(run.usage.turns, 2);
+	assert.equal(run.usage.turns, 2, JSON.stringify({ messages: run.messages, usage: run.usage, stderr: run.stderr }));
 	assert.equal(run.artifacts?.verification.length, 2);
 	assert.match(run.artifacts!.verification[0].output, /verified/);
 });
@@ -200,12 +200,170 @@ test("real pi streaming resets the watchdog while a silent tool hits the stall l
 	assert.equal((await runner.scheduler.snapshot()).leases.length, 0);
 });
 
+test("real request cap holds through streamed responses and excludes request queue time from stalls", { timeout: 20000 }, async () => {
+	const log = path.join(temp, "request-cap.jsonl");
+	process.env.SUBAGENTS_TEST_REQUEST_LOG = log;
+	const scheduler = new Scheduler(undefined, { concurrency: 4, maxProcesses: 4, maxRequests: 1 });
+	const runner = runnerFor(scheduler, { stallTimeoutMs: 500 });
+	try {
+		const runs = await Promise.all(Array.from({ length: 4 }, () =>
+			runner.run(defaults, worker, "STREAM_PROGRESS", { timeoutSeconds: 15 })));
+		for (const run of runs) assert.equal(run.status, "ok", `${run.errorMessage}\n${run.stderr}`);
+		const events = fs.readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		let active = 0;
+		let peak = 0;
+		for (const event of events) { active += event.phase === "start" ? 1 : -1; peak = Math.max(peak, active); }
+		assert.equal(events.length, 8);
+		assert.equal(peak, 1);
+		assert.equal(active, 0);
+		const tree = await scheduler.snapshot();
+		assert.deepEqual(tree.requests, []);
+		assert.deepEqual(tree.leases, []);
+		assert.ok(Math.abs(tree.cost - 0.04) < 1e-12);
+	} finally { delete process.env.SUBAGENTS_TEST_REQUEST_LOG; }
+});
+
+test("cancellation removes a real model-request waiter without starting its provider", { timeout: 15000 }, async () => {
+	const log = path.join(temp, "request-cancel.jsonl");
+	process.env.SUBAGENTS_TEST_REQUEST_LOG = log;
+	const scheduler = new Scheduler(undefined, { concurrency: 2, maxRequests: 1 });
+	const runner = runnerFor(scheduler, { stallTimeoutMs: 500 });
+	try {
+		const first = runner.run(defaults, worker, "STREAM_PROGRESS_LONG", { timeoutSeconds: 10 });
+		for (let i = 0; i < 200 && !fs.existsSync(log); i++) await new Promise((resolve) => setTimeout(resolve, 10));
+		assert.ok(fs.existsSync(log), "first request did not start");
+		const second = runner.run(defaults, worker, "queued request", { timeoutSeconds: 0.8 });
+		const [completed, cancelled] = await Promise.all([first, second]);
+		assert.equal(completed.status, "ok", `${completed.errorMessage}\n${completed.stderr}`);
+		assert.equal(cancelled.status, "timeout", `${cancelled.errorMessage}\n${cancelled.stderr}`);
+		assert.match(fs.readFileSync(cancelled.sessionFile!, "utf8"), /subagents-ex-request-wait/);
+		const events = fs.readFileSync(log, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+		assert.equal(events.filter((event) => event.phase === "start").length, 1);
+		assert.deepEqual((await scheduler.snapshot()).requests, []);
+		assert.deepEqual((await scheduler.snapshot()).leases, []);
+	} finally { delete process.env.SUBAGENTS_TEST_REQUEST_LOG; }
+});
+
+test("actual automatic compaction shares request permits with streamed assistant responses", { timeout: 20000 }, async () => {
+	const settingsFile = path.join(process.env.PI_CODING_AGENT_DIR!, "settings.json");
+	const settings = fs.readFileSync(settingsFile);
+	const log = path.join(temp, "native-request-cap.jsonl");
+	process.env.SUBAGENTS_TEST_REQUEST_LOG = log;
+	fs.writeFileSync(settingsFile, JSON.stringify({ retry: { enabled: false }, packages: [],
+		compaction: { enabled: true, reserveTokens: 1024, keepRecentTokens: 1 } }));
+	const events = () => fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
+	const scheduler = new Scheduler(undefined, { concurrency: 2, maxRequests: 1 });
+	const runner = runnerFor(scheduler, { stallTimeoutMs: 5000 });
+	const controller = new AbortController();
+	const pending: Promise<unknown>[] = [];
+	try {
+		const native = runner.run(defaults, { ...worker, model: "subagents-test/fixture-compact" }, "NATIVE_COMPACT", { timeoutSeconds: 12 }, undefined, controller.signal);
+		pending.push(native);
+		for (let i = 0; i < 100 && !events().some((event) => event.kind === "summary"); i++)
+			await new Promise((resolve) => setTimeout(resolve, 40));
+		assert.ok(events().some((event) => event.kind === "summary"), "must exercise the actual native summarizer");
+		const streamed = runner.run(defaults, worker, "STREAM_PROGRESS", { timeoutSeconds: 12 }, undefined, controller.signal);
+		pending.push(streamed);
+		const runs = await Promise.all([native, streamed]);
+		for (const run of runs) assert.equal(run.status, "ok", `${run.errorMessage}\n${run.stderr}`);
+		let active = 0, peak = 0;
+		for (const event of events()) { active += event.phase === "start" ? 1 : -1; peak = Math.max(peak, active); }
+		assert.equal(peak, 1);
+		assert.equal(active, 0);
+		assert.match(fs.readFileSync(runs[0].sessionFile!, "utf8"), /"type":"compaction"/);
+		const tree = await scheduler.snapshot();
+		assert.deepEqual(tree.requests, []);
+		assert.deepEqual(tree.leases, []);
+		assert.ok(Math.abs(tree.cost - events().filter((event) => event.phase === "start").length * 0.01) < 1e-12);
+	} finally { controller.abort(); await Promise.allSettled(pending); fs.writeFileSync(settingsFile, settings); delete process.env.SUBAGENTS_TEST_REQUEST_LOG; }
+});
+
+test("cancelling a queued native compaction does not start an unadmitted summarizer", { timeout: 20000 }, async () => {
+	const settingsFile = path.join(process.env.PI_CODING_AGENT_DIR!, "settings.json");
+	const settings = fs.readFileSync(settingsFile);
+	const log = path.join(temp, "native-request-cancel.jsonl");
+	process.env.SUBAGENTS_TEST_REQUEST_LOG = log;
+	fs.writeFileSync(settingsFile, JSON.stringify({ retry: { enabled: false }, packages: [],
+		compaction: { enabled: true, reserveTokens: 1024, keepRecentTokens: 1 } }));
+	const events = () => fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
+	const scheduler = new Scheduler(undefined, { concurrency: 2, maxRequests: 1 });
+	const runner = runnerFor(scheduler, { stallTimeoutMs: 5000 });
+	const controller = new AbortController();
+	const pending: Promise<unknown>[] = [];
+	let nativeId = "";
+	try {
+		const native = runner.run(defaults, { ...worker, model: "subagents-test/fixture-compact" }, "STREAM_PROGRESS", { timeoutSeconds: 12 }, undefined, controller.signal,
+			(run) => { nativeId = run.id; });
+		pending.push(native);
+		for (let i = 0; i < 100 && !events().length; i++) await new Promise((resolve) => setTimeout(resolve, 30));
+		assert.ok(events().length);
+		const streamed = runner.run(defaults, worker, "STREAM_PROGRESS_LONG", { timeoutSeconds: 12 });
+		pending.push(streamed);
+		let waiting = false;
+		for (let i = 0; i < 160; i++) {
+			waiting = (await scheduler.snapshot()).requests.some((request) => request.leaseId === nativeId && !request.active);
+			if (waiting) break;
+			await new Promise((resolve) => setTimeout(resolve, 30));
+		}
+		assert.equal(waiting, true, "native summarization must wait behind the already-queued assistant");
+		controller.abort();
+		const [cancelled, completed] = await Promise.all([native, streamed]);
+		assert.equal(cancelled.status, "aborted", `${cancelled.errorMessage}\n${cancelled.stderr}`);
+		assert.equal(completed.status, "ok", `${completed.errorMessage}\n${completed.stderr}`);
+		assert.equal(events().filter((event) => event.kind === "summary").length, 0);
+		assert.deepEqual((await scheduler.snapshot()).requests, []);
+		assert.deepEqual((await scheduler.snapshot()).leases, []);
+	} finally { controller.abort(); await Promise.allSettled(pending); fs.writeFileSync(settingsFile, settings); delete process.env.SUBAGENTS_TEST_REQUEST_LOG; }
+});
+
+test("actual native summary failure and in-flight abort release request admission", { timeout: 25000 }, async (t) => {
+	for (const mode of ["failure", "abort"] as const) await t.test(mode, async () => {
+		const settingsFile = path.join(process.env.PI_CODING_AGENT_DIR!, "settings.json");
+		const settings = fs.readFileSync(settingsFile);
+		const log = path.join(temp, `native-request-${mode}.jsonl`);
+		process.env.SUBAGENTS_TEST_REQUEST_LOG = log;
+		fs.writeFileSync(settingsFile, JSON.stringify({ retry: { enabled: false }, packages: [],
+			compaction: { enabled: true, reserveTokens: 1024, keepRecentTokens: 1 } }));
+		const events = () => fs.existsSync(log) ? fs.readFileSync(log, "utf8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line)) : [];
+		const scheduler = new Scheduler(undefined, { concurrency: 2, maxRequests: 1 });
+		const runner = runnerFor(scheduler, { stallTimeoutMs: 5000 });
+		const controller = new AbortController();
+		const other = new AbortController();
+		const pending: Promise<unknown>[] = [];
+		try {
+			const native = runner.run(defaults, { ...worker, model: "subagents-test/fixture-compact" },
+				mode === "failure" ? "NATIVE_SUMMARY_FAIL" : "NATIVE_SUMMARY_ABORT", { timeoutSeconds: 12 }, undefined, controller.signal);
+			pending.push(native);
+			for (let i = 0; i < 100 && !events().some((event) => event.kind === "summary"); i++)
+				await new Promise((resolve) => setTimeout(resolve, 40));
+			assert.ok(events().some((event) => event.kind === "summary" && event.phase === "start"));
+			const streamed = runner.run(defaults, worker, "STREAM_PROGRESS", { timeoutSeconds: 12 }, undefined, other.signal);
+			pending.push(streamed);
+			const [finished, completed] = await Promise.all([native, streamed]);
+			// The fixture aborts actual compaction through ctx.abort(), not a process kill.
+			// The completed assistant response remains valid after failed/aborted maintenance.
+			assert.equal(finished.status, "ok", `${finished.errorMessage}\n${finished.stderr}`);
+			assert.equal(completed.status, "ok", `${completed.errorMessage}\n${completed.stderr}`);
+			assert.ok(events().some((event) => event.kind === "summary" && event.phase === "end" && event.outcome === (mode === "abort" ? "aborted" : "error")));
+			let active = 0, peak = 0;
+			for (const event of events()) { active += event.phase === "start" ? 1 : -1; peak = Math.max(peak, active); }
+			assert.equal(peak, 1);
+			assert.equal(active, 0);
+			assert.deepEqual((await scheduler.snapshot()).requests, []);
+			assert.deepEqual((await scheduler.snapshot()).leases, []);
+		} finally {
+			controller.abort(); other.abort(); await Promise.allSettled(pending);
+			fs.writeFileSync(settingsFile, settings); delete process.env.SUBAGENTS_TEST_REQUEST_LOG;
+		}
+	});
+});
+
 test(
 	"real nested delegation uses the default launcher, yields the parent slot, and bills descendants once",
 	{ timeout: 30000 },
 	async () => {
 		const extDir = installFixtureExtensions();
-		const runner = new Runner({ scheduler: new Scheduler(undefined, { concurrency: 1 }), killGraceMs: 1000 });
+		const runner = new Runner({ scheduler: new Scheduler(undefined, { concurrency: 1, maxRequests: 1 }), killGraceMs: 1000 });
 		try {
 			const run = await runner.run(defaults, { ...worker, extensions: true, tools: ["subagent"] }, "DELEGATE", {
 				timeoutSeconds: 20,
