@@ -1,5 +1,5 @@
 /** RPC process engine. Each attempt has its own transcript and resumable session. */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -25,7 +25,18 @@ import {
 import { createWorktree, exportPatch, worktreeCwd } from "./worktree.ts";
 import { MAX_TIMEOUT_SECONDS, numberControl, validateControls, validatePrompt } from "./validation.ts";
 import { writeJson } from "./files.ts";
-import { directUsage, readAccountingEntries } from "./accounting.ts";
+import {
+	ManagedUsageTracker,
+	copySessionForResume,
+	directUsage,
+	messageUsageKey,
+	nativeUsage,
+	nativeUsageKey,
+	readSessionEntries,
+	sessionEntryKey,
+	usageStats,
+	type AccountingMarker,
+} from "./accounting.ts";
 
 export interface Invocation {
 	command: string;
@@ -38,6 +49,13 @@ export interface RunnerOptions {
 	/** Progress watchdog; defaults to PI_SUBAGENTS_EX_STALL_TIMEOUT_MS or ten minutes. */
 	stallTimeoutMs?: number;
 }
+interface AttemptAccounting {
+	namespace: string;
+	observeMessage: (message: Message) => boolean;
+	recover: () => Promise<void>;
+	captureStats: (totals: UsageStats) => Promise<void>;
+}
+
 export class RunStop extends Error {
 	status: RunStatus;
 	constructor(status: RunStatus, message: string) {
@@ -214,7 +232,7 @@ export class Runner {
 					throw new RunStop("budget", `Run cost budget reached ($${controls.maxCost})`);
 				const sessionFile = path.join(SESSIONS_DIR, `${record.id}-${n}.jsonl`);
 				if (n === 1 && overrides.resumeFrom?.sessionFile)
-					fs.copyFileSync(overrides.resumeFrom.sessionFile, sessionFile);
+					copySessionForResume(overrides.resumeFrom.sessionFile, sessionFile);
 				const attempt: AttemptRecord = {
 					number: n,
 					status: "running",
@@ -238,19 +256,94 @@ export class Runner {
 						: "";
 				const prompt = `Task: ${task}${feedback}${contract}`;
 				validatePrompt(prompt);
-				const priorAccounting = new Set(readAccountingEntries(sessionFile).map((entry) => entry.id));
-				await this.attempt(
-					record,
-					attempt,
-					agent,
-					defaults,
-					{ ...overrides, ...controls },
-					prompt,
-					controller.signal,
-					update,
-				);
-				for (const entry of readAccountingEntries(sessionFile))
-					if (!priorAccounting.has(entry.id)) addUsage(attempt.usage, entry.data.usage);
+				const namespace = `${record.id}-${n}`;
+				const historical = readSessionEntries(sessionFile);
+				const recovered = new Set(historical.map(sessionEntryKey));
+				const baseline = emptyUsage();
+				for (const entry of historical) {
+					const message = (entry.message ?? entry) as Message;
+					addUsage(baseline, nativeUsage(entry) ??
+						(message.role === "assistant" || message.role === "toolResult" ? message.usage : undefined));
+				}
+				// Match pi statistics: custom background receipts affect run totals, but
+				// are not included in get_session_stats. Startup work is new, not baseline.
+				const observedStats = emptyUsage();
+				let statisticsRemainder: UsageStats | undefined;
+				const seenMessages = new Set<string>();
+				// RPC events and final cleanup can both request recovery. Serialize the
+				// scans so reported totals, not just scheduler debits, remain idempotent.
+				let recovery = Promise.resolve();
+				const accounting: AttemptAccounting = {
+					namespace,
+					captureStats: async (totals) => {
+						// Include entries written during the RPC request, then freeze the
+						// remainder before stdin closes and shutdown hooks can append usage.
+						await accounting.recover();
+						statisticsRemainder = emptyUsage();
+						for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost"] as const)
+							statisticsRemainder[key] = Math.max(0, totals[key] - baseline[key] - observedStats[key]);
+					},
+					observeMessage: (message) => {
+						const key = messageUsageKey(message, namespace);
+						if (seenMessages.has(key)) return false;
+						seenMessages.add(key);
+						attempt.messages.push(message);
+						if (message.role === "assistant" || message.role === "toolResult") {
+							addUsage(
+								attempt.usage,
+								message.usage,
+								message.role === "assistant" && !(message.stopReason === "aborted" && !message.usage?.totalTokens) ? 1 : 0,
+							);
+							addUsage(observedStats, message.usage);
+						}
+						return true;
+					},
+					recover: () => (recovery = recovery.then(async () => {
+						for (const entry of readSessionEntries(sessionFile)) {
+							const key = sessionEntryKey(entry);
+							if (recovered.has(key)) continue;
+							const usage = nativeUsage(entry);
+							if (usage) {
+								await this.scheduler.addUsage(record.id, usageStats(usage), nativeUsageKey(entry, namespace));
+								addUsage(attempt.usage, usage);
+								addUsage(observedStats, usage);
+							} else if (entry.type === "custom" && entry.customType === "subagents-ex-accounting") {
+								addUsage(attempt.usage, (entry.data as AccountingMarker).usage);
+							} else {
+								// Legacy peers may persist raw messages rather than typed session entries.
+								const message = (entry.message ?? entry) as Message;
+								if (message.role === "assistant" || message.role === "toolResult") {
+									await this.scheduler.addUsage(record.id, directUsage(message, this.scheduler.id), messageUsageKey(message, namespace));
+									accounting.observeMessage(message);
+								}
+							}
+							recovered.add(key);
+						}
+						record.usage = aggregateUsage(record.attemptHistory!);
+					})),
+				};
+				try {
+					await this.attempt(
+						record,
+						attempt,
+						agent,
+						defaults,
+						{ ...overrides, ...controls },
+						prompt,
+						controller.signal,
+						update,
+						accounting,
+					);
+				} finally {
+					// Includes flushed usage even after SIGKILL, RPC truncation, or an early exit.
+					await accounting.recover();
+				}
+				if (statisticsRemainder) {
+					// Post-snapshot shutdown entries were recovered separately and must
+					// neither mask this remainder nor be charged again through it.
+					await this.scheduler.addUsage(record.id, statisticsRemainder, `stats:${namespace}`);
+					for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost"] as const) attempt.usage[key] += statisticsRemainder[key];
+				}
 				record.usage = aggregateUsage(record.attemptHistory);
 				await this.reconcileUsage(record);
 				record.status = attempt.status;
@@ -350,6 +443,7 @@ export class Runner {
 		prompt: string,
 		signal: AbortSignal,
 		update: () => void,
+		accounting: AttemptAccounting,
 	): Promise<void> {
 		return new Promise((resolve) => {
 			const args = ["--mode", "rpc", "--session", attempt.sessionFile];
@@ -381,32 +475,64 @@ export class Runner {
 					PI_SUBAGENTS_EX_PARENT_PID: String(process.pid),
 					PI_SUBAGENTS_EX_RUN_TURNS: String(options.maxTurns === undefined ? Infinity : options.maxTurns - priorTurns),
 					PI_SUBAGENTS_EX_RUN_COST: String(options.maxCost === undefined ? Infinity : options.maxCost - priorCost),
+					PI_SUBAGENTS_EX_TASK_NAMESPACE: accounting.namespace,
+					PI_SUBAGENTS_EX_SESSION_FILE: attempt.sessionFile,
 				},
 			});
 			record.childPid = proc.pid;
 			let buffer = "";
 			let processing = Promise.resolve();
-			let exited = false;
+			let leaderExited = false;
+			let outputDrained = false;
+			let cleanupComplete = false;
 			let finished = false;
 			let settled = false;
 			let stopping: RunStop | undefined;
 			let grace: NodeJS.Timeout | undefined;
 			let forceFinish: NodeJS.Timeout | undefined;
+			let exitDrain: NodeJS.Timeout | undefined;
 			let stallTimer: NodeJS.Timeout | undefined;
 			let watchingProgress = false;
 			const waitingForSubagents = new Set<string>();
 			let requestId = 0;
-			let baseline = emptyUsage();
+			const provenance = new ManagedUsageTracker();
 			const pending = new Map<
 				string,
 				{ resolve: (value: any) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }
 			>();
-			const signalProcess = (sig: NodeJS.Signals) => {
-				if (exited || !proc.pid) return;
+			const hasProcesses = () => {
+				if (!proc.pid) return false;
+				if (process.platform === "win32") return !leaderExited;
 				try {
-					if (process.platform !== "win32") process.kill(-proc.pid, sig);
-					else proc.kill(sig);
-				} catch {
+					process.kill(-proc.pid, 0);
+					return true;
+				} catch (err) {
+					return (err as NodeJS.ErrnoException).code !== "ESRCH";
+				}
+			};
+			let triedWindowsTreeKill = false;
+			const signalProcess = (sig: NodeJS.Signals) => {
+				if (!proc.pid) return;
+				if (process.platform !== "win32") {
+					try {
+						// The process group can outlive its RPC leader (and all of its pipes).
+						process.kill(-proc.pid, sig);
+						return;
+					} catch {
+						/* Fall back to the leader only while it is still owned by ChildProcess. */
+					}
+				} else if (!leaderExited && !triedWindowsTreeKill) {
+					triedWindowsTreeKill = true;
+					// Windows has no POSIX group signals or graceful proc.kill(). Kill the tree
+					// while its root still exists; bound/reap taskkill rather than detaching it.
+					const result = spawnSync(
+						path.join(process.env.SystemRoot || "C:\\Windows", "System32", "taskkill.exe"),
+						["/PID", String(proc.pid), "/T", "/F"],
+						{ stdio: "ignore", windowsHide: true, timeout: 1000 },
+					);
+					if (result.status === 0) return;
+				}
+				if (!leaderExited) {
 					try {
 						proc.kill(sig);
 					} catch {
@@ -415,16 +541,26 @@ export class Runner {
 				}
 			};
 			const armEscalation = () => {
-				if (grace) return;
+				if (grace || cleanupComplete) return;
 				grace = setTimeout(() => {
-					if (!stopping && !exited)
-						stopping = new RunStop("error", "Child did not exit after agent_settled; forced termination");
-					signalProcess("SIGKILL");
+					grace = undefined;
+					if (hasProcesses()) {
+						stopping ??= new RunStop(
+							"error",
+							leaderExited
+								? "Child left running descendants after exit; forced termination"
+								: "Child did not exit after agent_settled; forced termination",
+						);
+						signalProcess("SIGKILL");
+					}
+					cleanupComplete = true;
 					forceFinish = setTimeout(() => {
+						proc.stdin.destroy();
 						proc.stdout.destroy();
 						proc.stderr.destroy();
 						finish();
 					}, 1000);
+					if (leaderExited && outputDrained) void processing.finally(finish);
 				}, this.options.killGraceMs ?? 5000);
 			};
 			const clearStallTimer = () => {
@@ -439,7 +575,7 @@ export class Runner {
 				armEscalation();
 			};
 			const noteProgress = () => {
-				if (!watchingProgress || stopping || finished || exited || settled || waitingForSubagents.size) return;
+				if (!watchingProgress || stopping || finished || leaderExited || settled || waitingForSubagents.size) return;
 				if (stallTimer) stallTimer.refresh();
 				else
 					stallTimer = setTimeout(
@@ -450,7 +586,7 @@ export class Runner {
 			};
 			const request = (type: string, payload: Record<string, unknown> = {}): Promise<any> =>
 				new Promise((res, rej) => {
-					if (finished || stopping || proc.stdin.destroyed) return rej(new Error("Child is stopping"));
+					if (finished || stopping || leaderExited || proc.stdin.destroyed) return rej(new Error("Child is stopping"));
 					const id = String(++requestId);
 					const timer = setTimeout(() => {
 						pending.delete(id);
@@ -467,9 +603,20 @@ export class Runner {
 				});
 			const finish = () => {
 				if (finished) return;
+				// Neither leader exit nor pipe closure proves a detached group is gone.
+				// Keep the slot and escalation deadline until the group disappears or
+				// SIGKILL has been delivered. Do not wait for orphan zombies to be reaped.
+				if (!cleanupComplete && hasProcesses()) {
+					armEscalation();
+					return;
+				}
 				finished = true;
 				if (grace) clearTimeout(grace);
 				if (forceFinish) clearTimeout(forceFinish);
+				if (exitDrain) clearTimeout(exitDrain);
+				proc.stdin.destroy();
+				proc.stdout.destroy();
+				proc.stderr.destroy();
 				clearStallTimer();
 				clearInterval(budgetTimer);
 				signal.removeEventListener("abort", onAbort);
@@ -510,21 +657,20 @@ export class Runner {
 					stop(new RunStop("error", `Child guard failed: ${event.error}`));
 				if (event.type === "entry_appended" && event.entry?.customType === "subagents-ex-limit")
 					stop(new RunStop(event.entry.data.status, event.entry.data.reason));
+				if (event.type === "tool_execution_start" || event.type === "tool_execution_end")
+					provenance.observe(event, this.scheduler.id);
+				if (event.type === "agent_end") provenance.clear();
+				if (event.type === "entry_appended" || event.type === "compaction_end") {
+					await accounting.recover();
+					update();
+					if (!settled && options.maxCost !== undefined && record.usage.cost >= options.maxCost)
+						stop(new RunStop("budget", `Run cost budget reached ($${options.maxCost})`));
+				}
 				if (event.type === "message_end" && event.message) {
-					const msg = event.message as Message & {
-						subagentsExBudgetAccounted?: boolean;
-						subagentsExAccounting?: { usage: Usage };
-					};
-					attempt.messages.push(msg);
-					if (msg.role === "assistant" || msg.role === "toolResult") {
-						addUsage(
-							attempt.usage,
-							msg.usage,
-							msg.role === "assistant" && !(msg.stopReason === "aborted" && !msg.usage?.totalTokens) ? 1 : 0,
-						);
-						if (!msg.subagentsExBudgetAccounted)
-							await this.scheduler.addUsage(record.id, directUsage(msg, this.scheduler.id));
-					}
+					const msg = provenance.annotate(event.message, this.scheduler.id) as Message;
+					accounting.observeMessage(msg);
+					if (msg.role === "assistant" || msg.role === "toolResult")
+						await this.scheduler.addUsage(record.id, directUsage(msg, this.scheduler.id), messageUsageKey(msg, accounting.namespace));
 					if (msg.role === "assistant") {
 						attempt.stopReason = msg.stopReason;
 						attempt.errorMessage = msg.errorMessage;
@@ -540,15 +686,7 @@ export class Runner {
 				if (event.type === "agent_settled" && !settled && !stopping) {
 					settled = true;
 					this.active.delete(record.id);
-					const totals = statsUsage(await request("get_session_stats"));
-					// Include compaction and other usage represented only in session statistics.
-					const unreported = emptyUsage();
-					for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost"] as const)
-						unreported[key] = Math.max(0, totals[key] - baseline[key] - attempt.usage[key]);
-					await this.scheduler.addUsage(record.id, unreported);
-					for (const key of ["input", "output", "cacheRead", "cacheWrite", "cost"] as const)
-						attempt.usage[key] = Math.max(attempt.usage[key], totals[key] - baseline[key]);
-					record.usage = aggregateUsage(record.attemptHistory!);
+					await accounting.captureStats(statsUsage(await request("get_session_stats")));
 					proc.stdin.end();
 					armEscalation();
 				}
@@ -635,21 +773,28 @@ export class Runner {
 				finish();
 			});
 			proc.on("exit", () => {
-				exited = true;
+				leaderExited = true;
+				if (finished) return;
 				clearStallTimer();
 				for (const req of pending.values()) {
 					clearTimeout(req.timer);
 					req.reject(new Error("Child process exited"));
 				}
 				pending.clear();
-				// Descendants inheriting pipes cannot keep the orchestration promise open forever.
-				forceFinish = setTimeout(() => {
+				// Bound pipe draining independently of process-group cancellation. This must
+				// not replace the hard-kill fallback or cancel an existing grace deadline.
+				exitDrain = setTimeout(() => {
+					exitDrain = undefined;
+					outputDrained = true;
 					proc.stdout.destroy();
 					proc.stderr.destroy();
 					void processing.finally(finish);
 				}, 100);
 			});
 			proc.on("close", () => {
+				outputDrained = true;
+				if (exitDrain) clearTimeout(exitDrain);
+				exitDrain = undefined;
 				if (buffer.trim()) line(buffer);
 				void processing.finally(finish);
 			});
@@ -677,11 +822,10 @@ export class Runner {
 				const commands = await request("get_commands");
 				if (!commands?.commands?.some((c: { name: string }) => c.name === "subagents-ex-guard"))
 					throw new Error("Required child budget guard did not load");
-				baseline = statsUsage(await request("get_session_stats"));
 				watchingProgress = true;
 				noteProgress();
 				await request("prompt", { message: prompt });
-				if (!settled && !stopping)
+				if (!settled && !stopping && !leaderExited && !finished)
 					this.active.set(record.id, async (message) => {
 						await request("steer", { message });
 					});

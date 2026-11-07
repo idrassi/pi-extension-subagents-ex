@@ -2,7 +2,7 @@
 
 A pi extension based on the [official subagent example](https://github.com/earendil-works/pi/tree/main/packages/coding-agent/examples/extensions/subagent). It adds background task management, shared agent-tree budgets, worktree patch handoffs, validated output contracts, steering, resumable sessions, and durable run history.
 
-Requires **Node.js 22.19+ and pi 0.86.0 or later** (verified through pi **0.99.1**). Each worker runs in a separate pi RPC process. Worktrees separate checkouts; they are not an operating-system sandbox.
+Requires **Node.js 22.19+ and pi 0.86.0 or later** (type-checked and tested with pi **0.99.1 and 1.5.0**). Each worker runs in a separate pi RPC process. Worktrees separate checkouts; they are not an operating-system sandbox.
 
 ## Install
 
@@ -72,7 +72,7 @@ npm test
 npm run eval -- --check-fixtures
 ```
 
-Tests use temporary repositories and deterministic subprocesses, including a local provider running through the real pi CLI. They make no paid provider requests. CI runs on Node 22.19 and 24.
+Tests use temporary repositories and deterministic subprocesses, including a local provider running through the real pi CLI. They make no paid provider requests. Verification was run locally on Linux with Node 24.14.0 and pi 0.99.1/1.5.0; the advertised minimum Node/pi versions and other operating systems still need an automated compatibility matrix.
 
 ## Execution
 
@@ -114,7 +114,7 @@ Parallel calls accept 1–32 tasks and use the shared worker pool; chains accept
 | `maxCost` | Positive USD ceiling for observed run cost across attempts, including reported nested usage. Requests already in flight can overshoot. |
 | `isolation` | `none` or `worktree`. Single: one checkout. Parallel: one per task, with per-task overrides. Chain: one shared checkout, specified only at the top level. |
 | `outputFormat` | `text` or `json`. JSON must be one complete value, without prose or fences. Applies to the final chain step. |
-| `outputSchema` | JSON Schema draft-07; implies JSON output and validates its shape. Maximum schema size 64 KB. Uses strict Ajv schema checks; `format` annotations are not enforced. |
+| `outputSchema` | Synchronous JSON Schema draft-07; implies JSON output and validates its shape. Maximum serialized schema size is 64 KiB of UTF-8. Async validators are rejected. Each contract has an isolated Ajv registry; `format` annotations are not enforced. |
 | `agentScope` | `user` (default), `project`, or `both`. Bundled agents are always available. |
 | `runInBackground`, `notify` | Start a managed background task; completion notifications default to true. |
 | `resume` | Saved run ID to continue; `task` is the follow-up instruction. Preserves its checkout and copies its last child session into a new run. |
@@ -151,11 +151,11 @@ subagent({ resume: "run-<uuid>", task: "Address the review feedback" })
 
 Use `runId` with `subagent_task_send` when a parallel task has multiple active workers. Steering is queued at pi's next steering boundary; it does not interrupt a running tool. Workers must have reached RPC prompt acceptance before they accept steering. A settled worker can be resumed instead.
 
-Progress includes live statuses, turns, and usage. Reading output repeatedly does not charge it again. Completion usage is attached once to the next persisted assistant or tool message, regardless of collection. The task dashboard updates immediately; an idle parent session's token/cost footer catches up when that next message is persisted. Notifications are queued into the current loop or the next user turn, and do not start an unsolicited new turn while idle.
+Progress includes live statuses, turns, and usage. Reading output repeatedly does not charge it again. Completion usage is attached once to the next persisted **tool result**, regardless of collection, or recorded in a child shutdown receipt. Assistant provider usage is never inflated with background tokens, so pi's context-size estimates remain unchanged. The task dashboard updates immediately; an idle parent's token/cost footer can remain behind until the next tool result is persisted. Notifications are queued into the current loop or the next user turn, and do not start an unsolicited new turn while idle.
 
-Cancelling a collection wait leaves the background task running. Task cancellation stops its current workers. Session shutdown cancels all tasks and waits for cleanup. Workers also monitor their dispatcher and terminate if it disappears.
+Cancelling a collection wait leaves the background task running. Task cancellation stops its current workers. Session shutdown cancels all tasks and waits for cleanup. On POSIX, cancellation retains ownership of the process group after the RPC leader exits and escalates to SIGKILL before releasing its scheduler slot. Workers also monitor their dispatcher and retain a hard termination deadline through hanging shutdown hooks. Windows uses bounded `taskkill /T /F` while the leader is available; this is best-effort cleanup, not Job Object containment, and has not been verified on Windows.
 
-Task snapshots survive reload/resume of the parent session. Work interrupted by a crash is marked interrupted and is **not automatically relaunched**. Inspect the saved runs, then explicitly resume an available session. Resume charges only new work and uses the current agent definition, with project trust checked again. Deleted worktrees/sessions cannot be resumed. Concurrent use of the same worktree is rejected. These are session continuations, not exactly-once execution guarantees after a crash; usage available only in a killed provider request may be absent from the last durable snapshot.
+Task snapshots survive reload/resume of the parent session. Managed workers use a fresh run/attempt namespace: copying a transcript for a retry or sibling continuation does not transfer ownership of another attempt's background tasks. Work interrupted by a crash is marked interrupted and is **not automatically relaunched**. Inspect the saved runs, then explicitly resume an available session. Resume charges only new work and uses the current agent definition, with per-definition project authorization checked again. Deleted worktrees/sessions cannot be resumed. Concurrent use of the same worktree is rejected. These are session continuations, not exactly-once execution guarantees after a crash; usage available only in a killed provider request may be absent from the last durable snapshot.
 
 ## Shared scheduling and budgets
 
@@ -174,6 +174,8 @@ Set these variables before starting the parent session:
 With no overrides, run and turn totals are tracked without a cumulative ceiling. These defaults follow Claude Code's documented [20-subagent concurrency and unlimited session spawn count](https://code.claude.com/docs/en/sub-agents#concurrent-subagent-limit) and [10-minute progress watchdog](https://code.claude.com/docs/en/env-vars). This extension queues work above its active-worker limit and accepts up to 32 tasks per parallel call.
 
 The first use fixes shared tree limits in the session's durable ledger; resuming that session retains its consumption and limits. **Existing sessions keep their saved limits**, including the former defaults of 4 workers, 128 runs, and 1000 turns. Start a new parent pi session to adopt the new defaults; reloading the extension or changing environment variables does not rewrite an existing ledger. `/agents-budget` displays the current totals and labels absent run/turn ceilings `unlimited`. These budgets cover delegated work, not the top-level interactive model's own requests. A mandatory child extension checks explicit turn limits even when ordinary extensions are disabled. Nested managed usage is counted once; retries and other usage-bearing tool results remain billable. In-flight requests and usage reported late can overshoot cost ceilings. Accounting depends on provider-reported usage and is not a billing-system hard cap.
+
+The shared ledger deduplicates each reported charge atomically across the child guard, RPC observer, and durable recovery. Every attempt exit reconciles flushed session messages and native `usage`, `compaction`, and `branch_summary` entries before applying any remaining statistics delta. The remainder is frozen at a recovered pre-shutdown checkpoint, so shutdown entries cannot hide a separate statistics-only charge. This relies on pi's supported persistence/shutdown ordering, not an atomic snapshot with arbitrary concurrent session writers. Historical entries in copied continuations are excluded. An incomplete final JSONL write is tolerated; other malformed records fail recovery rather than silently discarding usage. This cannot recover provider usage that was never reported or flushed.
 
 Delegation is available at depths 0–2; workers at depth 3 cannot delegate further. `extensions: false` also disables further delegation. Custom extensions that make their own model requests outside pi's normal turn/usage events are outside the turn guard's scope.
 
@@ -223,7 +225,7 @@ retries: 1
 Complete the assigned task and report the verification performed.
 ```
 
-Invalid numeric frontmatter is rejected and reported in discovery diagnostics. Project agents require either pi project trust or explicit user confirmation for the selected definitions. Untrusted headless use is rejected. A model cannot disable that gate with `confirmProjectAgents: false`. Approval is cached only for the exact definition during the current extension session.
+Invalid numeric frontmatter is rejected and reported in discovery diagnostics. **Project agents always require explicit confirmation for the selected definitions**, even when pi reports the project as trusted: pi's trust API does not establish authorization for extension-owned `.pi/agents` resources. Unapproved headless use is rejected. A model cannot disable that gate with `confirmProjectAgents: false`. Approval is memory-only for the exact loaded definition, settings, metadata, and source path in the current session; changes require reapproval. Unapproved project descriptions and parse diagnostics are not injected into the system prompt, and unauthorized project overrides do not hide bundled/user fallbacks.
 
 Custom provider models require their provider extension to load in children. Keep `extensions: true` for those agents. Since pi 0.99.0, `--no-extensions` also disables pi's built-in extensions, so `extensions: false` children lose the llama.cpp provider and MCP-supplied tools as well. Tool allowlists, project trust, and worktrees do not restrict filesystem access as an OS sandbox would.
 
@@ -239,7 +241,7 @@ State lives under `~/.pi/agent/subagents-ex/` (or the configured `PI_CODING_AGEN
 |---|---|
 | `runs/` | Atomic snapshots: final outcome, all attempt messages and usage, diagnostics, metadata, bounded stderr |
 | `sessions/` | Native pi child sessions, one per attempt; used for resume |
-| `tasks/` | Background task snapshots, keyed by parent session |
+| `tasks/` | Background task snapshots, keyed by parent session and, for managed workers, run/attempt ownership |
 | `trees/` | Shared admission and budget ledgers |
 | `worktrees/` | Individual worktree records and live ownership |
 | `artifacts/` | Patches and command-evidence manifests |

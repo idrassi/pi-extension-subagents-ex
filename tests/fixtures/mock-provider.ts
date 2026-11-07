@@ -2,8 +2,76 @@
 import * as fs from "node:fs";
 import { createAssistantMessageEventStream, type AssistantMessage } from "@earendil-works/pi-ai";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import { Type } from "typebox";
 
 export default function mockProvider(pi: ExtensionAPI) {
+	pi.registerTool({
+		name: "fixture_wrap",
+		label: "Nested fixture",
+		description: "Exercise ctx.executeTool provenance, including an unrelated tool charge.",
+		parameters: Type.Object({ nested: Type.Boolean() }),
+		async execute(_id, args, _signal, _update, ctx) {
+			const outcome = args.nested
+				? await ctx.executeTool("fixture_wrap", { nested: false })
+				: await ctx.executeTool("subagent", { agent: "fixture-child", task: "complete the nested fixture" });
+			if (outcome.isError) throw new Error(JSON.stringify(outcome));
+			return {
+				content: [{ type: "text", text: "wrapped fixture complete" }],
+				details: {},
+				usage: {
+					input: args.nested ? 0 : 2, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: args.nested ? 0 : 2,
+					cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, total: args.nested ? 0 : 0.002 },
+				},
+			};
+		},
+	});
+	pi.registerTool({
+		name: "fixture_charge", label: "Unrelated billable fixture", description: "Unrelated usage and non-run metadata.",
+		parameters: Type.Object({}),
+		async execute() {
+			return { content: [{ type: "text", text: "billable fixture" }], details: { results: [null] },
+				usage: { input: 2, output: 0, cacheRead: 0, cacheWrite: 0, totalTokens: 2,
+					cost: { input: 0.002, output: 0, cacheRead: 0, cacheWrite: 0, total: 0.002 } } };
+		},
+	});
+	pi.registerTool({
+		name: "fixture_collect", label: "Free collection fixture", description: "Collect background metadata without charging it again.",
+		parameters: Type.Object({}),
+		async execute(_id, _args, _signal, _update, ctx) {
+			const queued = await ctx.executeTool("subagent", {
+				agent: "fixture-child", task: "complete the nested fixture", runInBackground: true, notify: false,
+			});
+			if (queued.isError) throw new Error(JSON.stringify(queued));
+			const id = (queued.result.details as { taskId: string }).taskId;
+			const collected = await ctx.executeTool("subagent_task_output", { id, wait: true });
+			if (collected.isError) throw new Error(JSON.stringify(collected));
+			const charged = await ctx.executeTool("fixture_charge", {});
+			if (charged.isError) throw new Error(JSON.stringify(charged));
+			// Pi attaches only the unrelated nested charge here; copied run details
+			// from free collection must not be interpreted as charge provenance.
+			return { content: collected.result.content, details: collected.result.details };
+		},
+	});
+	let nativeFixture = false;
+	pi.on("before_agent_start", (event) => {
+		nativeFixture = "prompt" in event && event.prompt.includes("COMPACT_THEN_HANG");
+	});
+	pi.on("agent_before_settle", () => {
+		if (!nativeFixture) return;
+		nativeFixture = false;
+		// A real pi boundary commit writes this native compaction usage to the session.
+		return {
+			entries: [
+				{
+					type: "compaction", summary: "Local fixture compaction", firstKeptEntryId: null,
+					usage: { input: 300, output: 150, cacheRead: 0, cacheWrite: 0, totalTokens: 450,
+						cost: { input: 0.15, output: 0.15, cacheRead: 0, cacheWrite: 0, total: 0.3 } },
+				},
+				{ type: "custom_message", customType: "native-fixture", content: "SLOW_CHILD", display: false },
+			],
+			continue: true,
+		};
+	});
 	pi.registerProvider("subagents-test", {
 		baseUrl: "http://127.0.0.1/unused",
 		apiKey: "local-fixture",
@@ -63,9 +131,12 @@ export default function mockProvider(pi: ExtensionAPI) {
 			const slow = prompt.includes("SLOW_CHILD");
 			const looping = prompt.includes("LOOP_TOOLS") || slow;
 			const background = prompt.includes("BACKGROUND_DELEGATE");
+			const wrapped = prompt.includes("WRAPPED_DELEGATE");
+			const collected = prompt.includes("COLLECT_WRAPPED_DELEGATE");
+			const delegateTool = collected ? "fixture_collect" : wrapped ? "fixture_wrap" : "subagent";
 			const delegate =
 				prompt.includes("DELEGATE") &&
-				!context.messages.some((m) => m.role === "toolResult" && m.toolName === "subagent");
+				!context.messages.some((m) => m.role === "toolResult" && m.toolName === delegateTool);
 			const message: AssistantMessage = {
 				role: "assistant",
 				api: model.api,
@@ -76,8 +147,8 @@ export default function mockProvider(pi: ExtensionAPI) {
 							{
 								type: "toolCall",
 								id: `delegate-${Date.now()}`,
-								name: "subagent",
-								arguments: {
+								name: delegateTool,
+								arguments: collected ? {} : wrapped ? { nested: prompt.includes("NESTED_WRAPPED_DELEGATE") } : {
 									agent: process.env.SUBAGENTS_TEST_CHILD_AGENT ?? "fixture-child",
 									task:
 										background || prompt.includes("FOREGROUND_SLOW_DELEGATE")

@@ -22,6 +22,8 @@ export interface TaskSnapshot {
 	usage: UsageStats;
 	result?: AgentToolResult<SubagentDetails>;
 	errorMessage?: string;
+	/** Continuations share transcript UUIDs, but never another run/attempt's task namespace. */
+	owner?: { sessionId: string; runNamespace?: string };
 }
 export interface ManagedTask extends TaskSnapshot {
 	controller: AbortController;
@@ -34,16 +36,21 @@ export type TaskExecutor = (
 export type SettleCallback = (task: ManagedTask) => void | Promise<void>;
 
 export function serializeTask(task: TaskSnapshot): TaskSnapshot {
-	const { id, kind, label, status, startedAt, endedAt, notify, summary, usage, result, errorMessage } = task;
-	return { id, kind, label, status, startedAt, endedAt, notify, summary, usage, result, errorMessage };
+	const { id, kind, label, status, startedAt, endedAt, notify, summary, usage, result, errorMessage, owner } = task;
+	return { id, kind, label, status, startedAt, endedAt, notify, summary, usage, result, errorMessage, owner };
 }
 
 export class TaskManager {
 	private tasks: ManagedTask[] = [];
 	private callbacks: SettleCallback[] = [];
 	private dir: string;
-	constructor(sessionId: string = randomUUID()) {
-		this.dir = path.join(STATE_DIR, "tasks", createHash("sha256").update(sessionId).digest("hex"));
+	private readonly owner: NonNullable<TaskSnapshot["owner"]>;
+	constructor(sessionId: string = randomUUID(), runNamespace = process.env.PI_SUBAGENTS_EX_TASK_NAMESPACE) {
+		this.owner = { sessionId, runNamespace };
+		// Preserve top-level session recovery and its legacy on-disk location. A
+		// managed worker gets a fresh namespace per attempt, including on resume.
+		const key = runNamespace === undefined ? sessionId : JSON.stringify([sessionId, runNamespace]);
+		this.dir = path.join(STATE_DIR, "tasks", createHash("sha256").update(key).digest("hex"));
 		let files: string[] = [];
 		try {
 			files = fs.readdirSync(this.dir).filter((f) => f.endsWith(".json"));
@@ -82,6 +89,7 @@ export class TaskManager {
 			kind,
 			label,
 			notify,
+			owner: this.owner,
 			status: "queued",
 			startedAt: Date.now(),
 			summary: "(queued)",

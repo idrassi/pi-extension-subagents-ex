@@ -5,12 +5,8 @@ import { after } from "node:test";
 
 export const temp = fs.mkdtempSync(path.join(os.tmpdir(), "pi-subagents-ex-test-"));
 process.env.PI_CODING_AGENT_DIR = path.join(temp, "agent");
-delete process.env.PI_SUBAGENTS_EX_TREE_ID;
-delete process.env.PI_SUBAGENTS_EX_LEASE_ID;
-delete process.env.PI_SUBAGENTS_EX_PARENT_PID;
-delete process.env.PI_SUBAGENTS_EX_POLICY;
-for (const key of ["CONCURRENCY", "MAX_RUNS", "MAX_TOTAL_TURNS", "MAX_COST", "STALL_TIMEOUT_MS"])
-	delete process.env[`PI_SUBAGENTS_EX_${key}`];
+// Tests must not inherit the dispatcher/worker environment running the suite.
+for (const key of Object.keys(process.env)) if (key.startsWith("PI_SUBAGENTS_EX_")) delete process.env[key];
 fs.mkdirSync(process.env.PI_CODING_AGENT_DIR, { recursive: true });
 fs.writeFileSync(
 	path.join(process.env.PI_CODING_AGENT_DIR, "settings.json"),

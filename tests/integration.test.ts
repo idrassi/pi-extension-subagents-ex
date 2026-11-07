@@ -63,6 +63,20 @@ test(
 	},
 );
 
+test("real pi resumes a truncated session tail without mutating the source or rebilling history", { timeout: 20000 }, async () => {
+	const runner = runnerFor();
+	const original = await runner.run(defaults, worker, "original", { timeoutSeconds: 10 });
+	assert.equal(original.status, "ok", `${original.errorMessage}\n${original.stderr}`);
+	fs.appendFileSync(original.sessionFile!, '{"type":"usage","usage":');
+	const source = fs.readFileSync(original.sessionFile!);
+	const resumed = await runner.run(defaults, worker, "continuation", { resumeFrom: original, timeoutSeconds: 10 });
+	assert.equal(resumed.status, "ok", `${resumed.errorMessage}\n${resumed.stderr}`);
+	assert.ok(Math.abs(resumed.usage.cost - 0.01) < 1e-12);
+	assert.ok(Math.abs((await runner.scheduler.snapshot()).cost - 0.02) < 1e-12);
+	assert.deepEqual(fs.readFileSync(original.sessionFile!), source);
+	for (const line of fs.readFileSync(resumed.sessionFile!, "utf8").trim().split("\n")) assert.doesNotThrow(() => JSON.parse(line));
+});
+
 test("real pi applies inherited and explicit thinking to the selected child model", { timeout: 60000 }, async (t) => {
 	const reasoningModel = "subagents-test/fixture-reasoning";
 	const cases: {
@@ -212,6 +226,48 @@ test(
 	},
 );
 
+test("real nested wrappers preserve managed provenance and bill unrelated tool usage", { timeout: 45000 }, async () => {
+	const extDir = installFixtureExtensions();
+	try {
+		for (const prompt of ["WRAPPED_DELEGATE", "NESTED_WRAPPED_DELEGATE", "COLLECT_WRAPPED_DELEGATE"]) {
+			const runner = new Runner({ scheduler: new Scheduler(undefined, { concurrency: 1 }), killGraceMs: 1000 });
+			const run = await runner.run(defaults, { ...worker, extensions: true,
+				tools: ["fixture_wrap", "fixture_collect", "fixture_charge", "subagent", "subagent_task_output"] }, prompt, {
+				timeoutSeconds: 20, maxTurns: 3,
+			});
+			assert.equal(run.status, "ok", `${run.errorMessage}\n${run.stderr}`);
+			const toolName = prompt === "COLLECT_WRAPPED_DELEGATE" ? "fixture_collect" : "fixture_wrap";
+			const result = run.messages.find((m) => m.role === "toolResult" && m.toolName === toolName);
+			assert.ok(result && result.role === "toolResult");
+			assert.equal(result.isError, false, JSON.stringify(result.content));
+			assert.ok(Math.abs(run.usage.cost - 0.032) < 1e-12, JSON.stringify(run.usage));
+			assert.equal(run.usage.input, 32);
+			const tree = await runner.scheduler.snapshot();
+			assert.equal(tree.runs, 2);
+			assert.equal(tree.turns, 3);
+			assert.ok(Math.abs(tree.cost - 0.032) < 1e-12, JSON.stringify(tree));
+		}
+	} finally { fs.rmSync(extDir, { recursive: true, force: true }); }
+});
+
+test("real pi retains committed native compaction usage after cancellation and across sibling resumes", { timeout: 30000 }, async () => {
+	const runner = runnerFor(undefined, { stallTimeoutMs: 500 });
+	const run = await runner.run(defaults, worker, "COMPACT_THEN_HANG", { timeoutSeconds: 10 });
+	assert.equal(run.status, "timeout", `${run.errorMessage}\n${run.stderr}`);
+	assert.match(run.errorMessage!, /stall timeout/);
+	assert.ok(Math.abs(run.usage.cost - 0.32) < 1e-12, JSON.stringify(run.usage));
+	assert.equal(run.usage.input, 320);
+	assert.ok(Math.abs((await runner.scheduler.snapshot()).cost - 0.32) < 1e-12);
+	const entries = fs.readFileSync(run.sessionFile!, "utf8").trim().split("\n").map((line) => JSON.parse(line));
+	assert.ok(entries.some((entry) => entry.type === "compaction" && entry.usage?.cost.total === 0.3));
+	for (const task of ["first sibling", "second sibling"]) {
+		const resumed = await runner.run(defaults, worker, task, { resumeFrom: run, timeoutSeconds: 10 });
+		assert.equal(resumed.status, "ok", `${resumed.errorMessage}\n${resumed.stderr}`);
+		assert.ok(Math.abs(resumed.usage.cost - 0.01) < 1e-12);
+	}
+	assert.ok(Math.abs((await runner.scheduler.snapshot()).cost - 0.34) < 1e-12);
+});
+
 test("child shutdown reports uncollected background usage before closing RPC", { timeout: 30000 }, async () => {
 	const extDir = installFixtureExtensions();
 	const runner = new Runner({ scheduler: new Scheduler(undefined, { concurrency: 2 }), killGraceMs: 5000 });
@@ -230,6 +286,27 @@ test("child shutdown reports uncollected background usage before closing RPC", {
 	} finally {
 		fs.rmSync(extDir, { recursive: true, force: true });
 	}
+});
+
+test("real sibling resumes do not adopt each other's completed background tasks", { timeout: 40000 }, async () => {
+	const extDir = installFixtureExtensions();
+	const runner = new Runner({ scheduler: new Scheduler(undefined, { concurrency: 2 }), killGraceMs: 5000 });
+	const agent = { ...worker, extensions: true, tools: ["subagent"] };
+	try {
+		const original = await runner.run(defaults, agent, "original", { timeoutSeconds: 20 });
+		assert.equal(original.status, "ok", `${original.errorMessage}\n${original.stderr}`);
+		const first = await runner.run(defaults, agent, "BACKGROUND_DELEGATE", { resumeFrom: original, timeoutSeconds: 20 });
+		assert.equal(first.status, "ok", `${first.errorMessage}\n${first.stderr}`);
+		assert.ok(Math.abs(first.usage.cost - 0.03) < 1e-12, JSON.stringify(first.usage));
+		const second = await runner.run(defaults, agent, "independent follow-up", { resumeFrom: original, timeoutSeconds: 20 });
+		assert.equal(second.status, "ok", `${second.errorMessage}\n${second.stderr}`);
+		assert.ok(Math.abs(second.usage.cost - 0.01) < 1e-12, JSON.stringify(second.usage));
+		const headers = [original, first, second].map((run) => JSON.parse(fs.readFileSync(run.sessionFile!, "utf8").split("\n")[0]));
+		assert.equal(headers[0].id, headers[1].id);
+		assert.equal(headers[0].id, headers[2].id);
+		assert.ok(Math.abs((await runner.scheduler.snapshot()).cost - 0.05) < 1e-12);
+		assert.doesNotMatch(fs.readFileSync(second.sessionFile!, "utf8"), /subagents-ex-accounting/);
+	} finally { fs.rmSync(extDir, { recursive: true, force: true }); }
 });
 
 test(

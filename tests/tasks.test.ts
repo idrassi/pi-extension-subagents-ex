@@ -93,8 +93,12 @@ test("additional accounting on a message preserves existing usage and cumulative
 	const one = manager.start("single", "one", false, async () => result("ok", 1));
 	await one.done;
 	const message = {
-		role: "assistant",
+		role: "toolResult",
+		toolCallId: "read",
+		toolName: "read",
 		content: [],
+		isError: false,
+		timestamp: Date.now(),
 		usage: toModelUsage({ input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0.1, contextTokens: 0, turns: 1 }),
 	} as any;
 	const ledger = new UsageLedger();

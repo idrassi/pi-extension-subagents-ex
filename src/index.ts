@@ -10,6 +10,7 @@ import { UsageLedger } from "./accounting.ts";
 import { openDashboard } from "./dashboard.ts";
 import { formatDuration, formatUsageStats } from "./format.ts";
 import { buildPlan, type PlanInput } from "./plan.ts";
+import { ProjectAgentTrust } from "./project-agent-trust.ts";
 import { executePlan } from "./orchestrator.ts";
 import { renderSubagentCall, renderSubagentResult, renderTaskListResult } from "./render.ts";
 import { Runner } from "./runner.ts";
@@ -113,7 +114,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	let sessionId: string | undefined;
 	let closing = false;
 	let widgetTimer: NodeJS.Timeout | undefined;
-	const approvals = new Set<string>();
+	const projectAgentTrust = new ProjectAgentTrust();
 
 	const updateWidget = () => {
 		if (closing || !lastCtx?.hasUI || !tasks) return;
@@ -191,7 +192,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			delete event.systemPromptOptions.sections.subagents;
 			return;
 		}
-		const discovery = discoverAgents(ctx.cwd, ctx.isProjectTrusted() ? "both" : "user");
+		const discovery = projectAgentTrust.discover(ctx);
 		const emphasis =
 			policy === "aggressive"
 				? "Delegate independent investigations and specialist implementation/review/test work unless the user opts out."
@@ -203,7 +204,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			"Use worktree isolation for parallel coding. Review the returned patch and verification evidence before applying it.",
 			"Background tasks can be steered with subagent_task_send. Collect their results before declaring their work complete.",
 			"Resume a saved run using subagent({resume: runId, task: followUp}); costs are new work and share the session budget.",
-			"Project agents require project trust or user approval; use agentScope both to select them.",
+			"Project agents require per-definition session confirmation, even with pi project trust; unapproved headless use is disabled. Use agentScope both to select them.",
 			"Available agents:",
 			...discovery.agents.map((a) => `- ${a.name} (${a.source}): ${a.description}`),
 			...discovery.errors.map((e) => `Invalid agent definition: ${e}`),
@@ -214,7 +215,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		name: "subagent",
 		label: "Subagent",
 		description:
-			"Execute specialist agents as a single task, parallel tasks, or a sequential chain. Supports background work, worktrees with patch artifacts, budgets, validated JSON, and resuming a saved run. Returns run ids, output, artifacts, and usage.",
+			"Execute specialist agents as a single task, parallel tasks, or a sequential chain. Supports background work, worktrees with patch artifacts, budgets, validated JSON, and resuming a saved run. Project definitions require per-definition session confirmation even with pi project trust; unapproved headless use is disabled. Returns run ids, output, artifacts, and usage.",
 		promptSnippet: "Run specialist agents (single, parallel, chain, background, resume)",
 		parameters: Params,
 		prepareArguments(args) {
@@ -225,7 +226,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			}
 			return args as any;
 		},
-		async execute(_id, params, signal, onUpdate, ctx) {
+		async execute(_id, rawParams, signal, onUpdate, ctx) {
+			// StringEnum's TypeBox inference differs across supported pi SDKs;
+			// execution receives the same schema-validated plan in either version.
+			const params = rawParams as PlanInput;
 			ensureSession(ctx);
 			let plan;
 			try {
@@ -233,7 +237,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				const discovery = discoverAgents(ctx.cwd, scope);
 				const resumed = params.resume ? (loadRunById(params.resume) ?? undefined) : undefined;
 				plan = buildPlan(
-					params as PlanInput,
+					params,
 					discovery.agents,
 					{
 						cwd: ctx.cwd,
@@ -244,29 +248,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					discovery.projectAgentsDir,
 					resumed,
 				);
-				const unapproved = plan.steps
-					.map((s) => s.agent)
-					.filter(
-						(agent) =>
-							agent.source === "project" &&
-							!ctx.isProjectTrusted() &&
-							!approvals.has(createHash("sha256").update(JSON.stringify(agent)).digest("hex")),
-					);
-				if (unapproved.length) {
-					if (!ctx.hasUI)
-						throw new Error(
-							"Project agents require user approval or project trust; untrusted headless execution is disabled",
-						);
-					if (
-						!(await ctx.ui.confirm(
-							"Run project-local agents?",
-							`${unapproved.map((a) => `${a.name}: ${a.filePath}`).join("\n")}\nThese definitions are controlled by the repository.`,
-						))
-					)
-						throw new Error("Project agents were not approved");
-					for (const agent of unapproved)
-						approvals.add(createHash("sha256").update(JSON.stringify(agent)).digest("hex"));
-				}
+				await projectAgentTrust.authorize(plan.steps.map((step) => step.agent), ctx, signal);
 				for (const step of plan.steps)
 					if (!fs.statSync(step.overrides.cwd!).isDirectory())
 						throw new Error(`Invalid working directory: ${step.overrides.cwd}`);

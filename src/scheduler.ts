@@ -29,7 +29,7 @@ export interface TreeState {
 	cost: number;
 	sequence: number;
 	leases: Lease[];
-	usageByRun: Record<string, { parentId?: string; usage: UsageStats }>;
+	usageByRun: Record<string, { parentId?: string; usage: UsageStats; usageEvents?: Record<string, true> }>;
 }
 
 export class BudgetError extends Error {}
@@ -189,13 +189,20 @@ export class Scheduler {
 	}
 
 	/** Direct usage is reported before RPC delivery, so parent cancellation cannot lose it. */
-	async addUsage(id: string, usage: UsageStats): Promise<void> {
+	async addUsage(id: string, usage: UsageStats, eventId?: string): Promise<void> {
 		if (Object.values(usage).some((n) => !Number.isFinite(n) || n < 0)) throw new Error("Invalid reported usage");
+		if (eventId !== undefined && (typeof eventId !== "string" || !eventId || eventId.length > 512))
+			throw new Error("Invalid usage event id");
 		await this.mutate((s) => {
 			const entry = s.usageByRun[id];
 			if (!entry) throw new Error(`Unknown usage owner: ${id}`);
+			// The guard, RPC observer, and crash recovery can all observe one durable
+			// charge. Commit its receipt and debit in the same locked transaction.
+			if (eventId && Object.hasOwn(entry.usageEvents ?? {}, eventId)) return;
 			entry.usage = aggregateUsage([entry, { usage }]);
 			s.cost += usage.cost;
+			if (eventId)
+				Object.defineProperty((entry.usageEvents ??= {}), eventId, { value: true, enumerable: true, configurable: true });
 		});
 	}
 
