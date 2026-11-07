@@ -142,6 +142,12 @@ export function compactRun(record: RunRecord | RunResult): RunResult {
 			.map((file) => ref(file)).filter((file): file is string => file !== undefined);
 		if (source.verification) artifacts.verification = source.verification.slice(-2).map((entry) => ({
 			command: label(entry.command, 256)!, exitCode: entry.exitCode, isError: entry.isError,
+			runId: ref(entry.runId), attempt: entry.attempt,
+			toolCallId: ref(entry.toolCallId), parentToolCallId: ref(entry.parentToolCallId),
+			outcome: entry.outcome, source: entry.source,
+			startObserved: entry.startObserved, endObserved: entry.endObserved, resultObserved: entry.resultObserved,
+			outputTruncated: entry.outputTruncated, fullOutputPath: ref(entry.fullOutputPath), fullOutputComplete: entry.fullOutputComplete,
+			outputError: label(entry.outputError, 256),
 		}));
 		omitted ||= artifacts.changedFileCount > (artifacts.changedFiles?.length ?? 0) || artifacts.commandCount > (artifacts.verification?.length ?? 0) ||
 			(source.verification ?? []).some((entry) => "output" in entry);

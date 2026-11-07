@@ -4,6 +4,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { randomUUID } from "node:crypto";
 import { fileURLToPath } from "node:url";
+import { performance } from "node:perf_hooks";
 import type { Message, Usage } from "@earendil-works/pi-ai";
 import { getPackageDir } from "@earendil-works/pi-coding-agent";
 import type { AgentConfig } from "./agents.ts";
@@ -20,11 +21,11 @@ import {
 	type RunRecord,
 	type RunStatus,
 	type UsageStats,
-	type VerificationEvidence,
 } from "./types.ts";
 import { createWorktree, exportPatch, worktreeCwd } from "./worktree.ts";
 import { MAX_TIMEOUT_SECONDS, numberControl, validateControls, validatePrompt } from "./validation.ts";
 import { writeJson } from "./files.ts";
+import { VerificationCollector } from "./verification.ts";
 import {
 	ManagedUsageTracker,
 	copySessionForResume,
@@ -42,7 +43,17 @@ export interface Invocation {
 	command: string;
 	prefix?: string[];
 }
+/** Optional dispatcher-local lifecycle observations; timestamps share performance.now()'s clock. */
+export interface RunnerEvent {
+	type: "queued" | "admitted" | "spawned" | "prompt_sent" | "prompt_accepted" | "first_token" | "settled" | "finished";
+	runId: string;
+	attempt?: number;
+	pid?: number;
+	at: number;
+}
 export interface RunnerOptions {
+	/** Observational only: synchronous throws and async rejections never own execution. Not persisted. */
+	onEvent?: (event: RunnerEvent) => void;
 	scheduler?: Scheduler;
 	invocation?: Invocation;
 	killGraceMs?: number;
@@ -95,34 +106,6 @@ function stopFromSignal(signal: AbortSignal): RunStop {
 	return signal.reason instanceof RunStop ? signal.reason : new RunStop("aborted", "Run cancelled");
 }
 
-function verification(messages: Message[]): VerificationEvidence[] {
-	const calls = new Map<string, string>();
-	const evidence: VerificationEvidence[] = [];
-	for (const message of messages) {
-		if (message.role === "assistant")
-			for (const part of message.content) {
-				if (part.type === "toolCall" && part.name === "bash" && typeof part.arguments.command === "string")
-					calls.set(part.id, part.arguments.command);
-			}
-		if (message.role === "toolResult" && calls.has(message.toolCallId)) {
-			const details = message.details as { exitCode?: number } | undefined;
-			evidence.push({
-				command: calls.get(message.toolCallId)!,
-				exitCode: details?.exitCode ?? (message.isError ? undefined : 0),
-				isError: message.isError,
-				output: truncateToBytes(
-					message.content
-						.filter((c) => c.type === "text")
-						.map((c) => c.text)
-						.join("\n"),
-					8192,
-				).text,
-			});
-		}
-	}
-	return evidence;
-}
-
 export class Runner {
 	readonly scheduler: Scheduler;
 	private options: RunnerOptions;
@@ -131,6 +114,16 @@ export class Runner {
 	private budgetWatchers = new Set<(reason: string) => void>();
 	private budgetTimer?: NodeJS.Timeout;
 	private budgetChecking = false;
+	private emit(type: RunnerEvent["type"], runId: string, attempt?: number, pid?: number): void {
+		const observer = this.options.onEvent;
+		if (!observer) return;
+		try {
+			const result = observer({ type, runId, attempt, pid, at: performance.now() }) as unknown;
+			// Async observers are allowed by TypeScript's void callback contract too.
+			if (result && typeof (result as PromiseLike<unknown>).then === "function")
+				void Promise.resolve(result).catch(() => {});
+		} catch { /* telemetry must not change execution or cleanup */ }
+	}
 	private watchBudget(listener: (reason: string) => void): () => void {
 		this.budgetWatchers.add(listener);
 		this.budgetTimer ??= setInterval(() => {
@@ -215,6 +208,7 @@ export class Runner {
 		let workspaceReady = false;
 		let progressTimer: NodeJS.Timeout | undefined;
 		let progressSavedAt = 0;
+		const verification = new Map<number, VerificationCollector>();
 		const persist = () => {
 			progressSavedAt = Date.now();
 			saveRun(record);
@@ -249,7 +243,9 @@ export class Runner {
 				);
 			controller.signal.throwIfAborted();
 			update();
+			this.emit("queued", record.id);
 			releaseSlot = await this.scheduler.acquire(record.id, controller.signal);
+			this.emit("admitted", record.id);
 			controller.signal.throwIfAborted();
 			if (overrides.isolation === "worktree" && !record.worktree) {
 				record.worktree = await createWorktree(record.cwd, record.id);
@@ -297,6 +293,10 @@ export class Runner {
 				validatePrompt(prompt);
 				const namespace = `${record.id}-${n}`;
 				const historical = readSessionEntries(sessionFile);
+				const evidence = new VerificationCollector({ runId: record.id, attempt: n, artifactDir: ARTIFACTS_DIR,
+					cwd: record.cwd, historicalMessages: historical.map((entry) => entry.message ?? entry) });
+				attempt.verification = evidence.evidence;
+				verification.set(n, evidence);
 				const recovered = new Set(historical.map(sessionEntryKey));
 				const baseline = emptyUsage();
 				for (const entry of historical) {
@@ -323,6 +323,8 @@ export class Runner {
 							statisticsRemainder[key] = Math.max(0, totals[key] - baseline[key] - observedStats[key]);
 					},
 					observeMessage: (message) => {
+						try { evidence.observeMessage(message); }
+						catch (err) { attempt.diagnostics.push(`Verification capture failed: ${String(err)}`); }
 						const key = messageUsageKey(message, namespace);
 						if (seenMessages.has(key)) return false;
 						seenMessages.add(key);
@@ -337,29 +339,35 @@ export class Runner {
 						}
 						return true;
 					},
-					recover: () => (recovery = recovery.then(async () => {
-						for (const entry of readSessionEntries(sessionFile)) {
-							const key = sessionEntryKey(entry);
-							if (recovered.has(key)) continue;
-							const usage = nativeUsage(entry);
-							if (usage) {
-								await this.scheduler.addUsage(record.id, usageStats(usage), nativeUsageKey(entry, namespace));
-								addUsage(attempt.usage, usage);
-								addUsage(observedStats, usage);
-							} else if (entry.type === "custom" && entry.customType === "subagents-ex-accounting") {
-								addUsage(attempt.usage, (entry.data as AccountingMarker).usage);
-							} else {
-								// Legacy peers may persist raw messages rather than typed session entries.
-								const message = (entry.message ?? entry) as Message;
-								if (message.role === "assistant" || message.role === "toolResult") {
-									await this.scheduler.addUsage(record.id, directUsage(message, this.scheduler.id), messageUsageKey(message, namespace));
-									accounting.observeMessage(message);
+					recover: () => {
+						const scan = recovery.then(async () => {
+							for (const entry of readSessionEntries(sessionFile)) {
+								const key = sessionEntryKey(entry);
+								if (recovered.has(key)) continue;
+								const usage = nativeUsage(entry);
+								if (usage) {
+									await this.scheduler.addUsage(record.id, usageStats(usage), nativeUsageKey(entry, namespace));
+									addUsage(attempt.usage, usage);
+									addUsage(observedStats, usage);
+								} else if (entry.type === "custom" && entry.customType === "subagents-ex-accounting") {
+									addUsage(attempt.usage, (entry.data as AccountingMarker).usage);
+								} else {
+									// Legacy peers may persist raw messages rather than typed session entries.
+									const message = (entry.message ?? entry) as Message;
+									if (message.role === "assistant" || message.role === "toolResult") {
+										await this.scheduler.addUsage(record.id, directUsage(message, this.scheduler.id), messageUsageKey(message, namespace));
+										accounting.observeMessage(message);
+									}
 								}
+								recovered.add(key);
 							}
-							recovered.add(key);
-						}
-						record.usage = aggregateUsage(record.attemptHistory!);
-					})),
+							record.usage = aggregateUsage(record.attemptHistory!);
+						});
+						// Report this scan's failure to its caller without poisoning every
+						// subsequent scan (notably the mandatory post-exit recovery).
+						recovery = scan.catch(() => {});
+						return scan;
+					},
 				};
 				try {
 					await this.attempt(
@@ -372,6 +380,7 @@ export class Runner {
 						controller.signal,
 						update,
 						accounting,
+						evidence,
 					);
 				} finally {
 					// Includes flushed usage even after SIGKILL, RPC truncation, or an early exit.
@@ -428,11 +437,12 @@ export class Runner {
 				record.errorMessage = `Usage reconciliation failed: ${String(err)}`;
 				record.status = "error";
 			}
+			for (const attempt of record.attemptHistory) verification.get(attempt.number)?.finish(attempt.status);
 			try {
 				if (workspaceReady && record.worktree && fs.existsSync(record.worktree.path))
 					record.artifacts = await exportPatch(record.worktree, record.id);
 				record.artifacts ??= { changedFiles: [], verification: [] };
-				record.artifacts.verification = verification(record.attemptHistory.flatMap((a) => a.messages));
+				record.artifacts.verification = record.attemptHistory.flatMap((attempt) => attempt.verification ?? []);
 				record.artifacts.output = runOutputFile(record.id);
 				record.artifacts.manifest = path.join(ARTIFACTS_DIR, `${record.id}.json`);
 				writeJson(record.artifacts.manifest, { runId: record.id, ...record.artifacts });
@@ -459,6 +469,7 @@ export class Runner {
 				record.status = "error";
 				record.errorMessage = `Run persistence/update failed: ${String(err)}`;
 			}
+			this.emit("finished", record.id, record.attempts || undefined, record.childPid);
 		}
 		return record;
 	}
@@ -484,6 +495,7 @@ export class Runner {
 		signal: AbortSignal,
 		update: (immediate?: boolean) => void,
 		accounting: AttemptAccounting,
+		verification: VerificationCollector,
 	): Promise<void> {
 		return new Promise((resolve) => {
 			const args = ["--mode", "rpc", "--session", attempt.sessionFile];
@@ -520,6 +532,7 @@ export class Runner {
 				},
 			});
 			record.childPid = proc.pid;
+			proc.once("spawn", () => this.emit("spawned", record.id, attempt.number, proc.pid));
 			let buffer = "";
 			let processing = Promise.resolve();
 			let leaderExited = false;
@@ -527,6 +540,8 @@ export class Runner {
 			let cleanupComplete = false;
 			let finished = false;
 			let settled = false;
+			let settledEventSeen = false;
+			let firstTokenSeen = false;
 			let stopping: RunStop | undefined;
 			let grace: NodeJS.Timeout | undefined;
 			let forceFinish: NodeJS.Timeout | undefined;
@@ -540,7 +555,7 @@ export class Runner {
 			const provenance = new ManagedUsageTracker();
 			const pending = new Map<
 				string,
-				{ resolve: (value: any) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }
+				{ type: string; resolve: (value: any) => void; reject: (err: Error) => void; timer: NodeJS.Timeout }
 			>();
 			const hasProcesses = () => {
 				if (!proc.pid) return false;
@@ -634,7 +649,8 @@ export class Runner {
 						pending.delete(id);
 						rej(new Error(`RPC ${type} timed out`));
 					}, 15_000);
-					pending.set(id, { resolve: res, reject: rej, timer });
+					pending.set(id, { type, resolve: res, reject: rej, timer });
+					if (type === "prompt") this.emit("prompt_sent", record.id, attempt.number, proc.pid);
 					proc.stdin.write(`${JSON.stringify({ id, type, ...payload })}\n`, (err) => {
 						if (err) {
 							clearTimeout(timer);
@@ -734,7 +750,7 @@ export class Runner {
 				}
 			};
 			const line = (text: string) => {
-				if (!text.trim()) return;
+				if (finished || !text.trim()) return;
 				let event: any;
 				try {
 					event = JSON.parse(text);
@@ -742,7 +758,28 @@ export class Runner {
 					stop(new RunStop("error", "Invalid JSON in child RPC stream"));
 					return;
 				}
-				// Observe actual events on arrival, before asynchronous accounting can delay delivery.
+				// Observe evidence/timing on arrival: queued accounting work must not hide a
+				// nested end or move a timing boundary past an asynchronous ledger await.
+				let evidenceChanged = false;
+				try { evidenceChanged = verification.observeEvent(event); }
+				catch (err) {
+					attempt.diagnostics.push(`Verification capture failed: ${String(err)}`);
+					evidenceChanged = true;
+				}
+				if (evidenceChanged) {
+					try { update(false); }
+					catch (err) { stop(new RunStop("error", `Run persistence failed: ${String(err)}`)); }
+				}
+				if (this.options.onEvent && !firstTokenSeen && event.type === "message_update" &&
+					["text_delta", "thinking_delta"].includes(event.assistantMessageEvent?.type) &&
+					typeof event.assistantMessageEvent.delta === "string" && event.assistantMessageEvent.delta.length > 0) {
+					firstTokenSeen = true;
+					this.emit("first_token", record.id, attempt.number, proc.pid);
+				}
+				if (event.type === "agent_settled" && !settledEventSeen) {
+					settledEventSeen = true;
+					this.emit("settled", record.id, attempt.number, proc.pid);
+				}
 				// RPC responses, stderr, and unrelated notifications are not evidence of progress.
 				if (event.type === "entry_appended" && event.entry?.customType === "subagents-ex-request-wait") {
 					waitingForRequest = event.entry.data?.waiting === true;
@@ -778,6 +815,7 @@ export class Runner {
 					if (req) {
 						clearTimeout(req.timer);
 						pending.delete(event.id);
+						if (event.success && req.type === "prompt") this.emit("prompt_accepted", record.id, attempt.number, proc.pid);
 						event.success ? req.resolve(event.data) : req.reject(new Error(event.error ?? "RPC command rejected"));
 					}
 					return;

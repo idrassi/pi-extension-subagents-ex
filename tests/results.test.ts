@@ -129,6 +129,36 @@ test("raw RunRecord fixtures remain assignable and compact details sanitize lega
 	assert.ok(bytes(compact) <= MAX_RESULT_DETAILS_BYTES);
 });
 
+test("compact verification preserves observed outcomes and exact small identities without inventing success", () => {
+	const record = run();
+	record.artifacts = { changedFiles: [], verification: [
+		{ runId: record.id, attempt: 1, toolCallId: "wrapper/bash", parentToolCallId: "wrapper",
+			command: "npm test", outcome: "completed", source: "event", startObserved: true, endObserved: true,
+			output: "PRIVATE-VERIFICATION".repeat(1000), outputTruncated: true,
+			fullOutputPath: "/artifacts/evidence.txt", fullOutputComplete: true },
+		{ runId: record.id, attempt: 2, toolCallId: "x".repeat(10_000), command: "npm test",
+			outcome: "incomplete", startObserved: true, endObserved: false, resultObserved: false, output: "partial", outputError: "EACCES" },
+	] };
+	const published = resultFor(details([record]));
+	assertBounded(published);
+	const entries = published.details.results[0].artifacts!.verification!;
+	assert.equal(entries[0].runId, record.id);
+	assert.equal(entries[0].toolCallId, "wrapper/bash");
+	assert.equal(entries[0].parentToolCallId, "wrapper");
+	assert.equal(entries[0].outcome, "completed");
+	assert.equal(entries[0].exitCode, undefined);
+	assert.equal(entries[0].fullOutputPath, "/artifacts/evidence.txt");
+	assert.equal(entries[1].outcome, "incomplete");
+	assert.equal(entries[1].endObserved, false);
+	assert.equal(entries[1].resultObserved, false);
+	assert.equal(entries[1].outputError, "EACCES");
+	assert.equal(entries[1].exitCode, undefined);
+	assert.equal(entries[1].toolCallId, undefined, "oversized optional identity is omitted, never clipped into another identity");
+	assert.equal(published.details.results[0].metadataTruncated, true);
+	assert.ok(!JSON.stringify(published).includes("PRIVATE-VERIFICATION"));
+	assert.deepEqual(compactDetails(published.details), published.details);
+});
+
 test("legacy task/result wrappers and cyclic unknown details cannot reintroduce transcripts", () => {
 	const raw = run(0, "🧪".repeat(20_000));
 	const wrapper: any = { task: { id: "task-id", result: { content: [{ type: "text", text: "huge".repeat(20_000) }], details: details([raw]) } } };

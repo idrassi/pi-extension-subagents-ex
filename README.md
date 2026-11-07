@@ -2,7 +2,7 @@
 
 A pi extension based on the [official subagent example](https://github.com/earendil-works/pi/tree/main/packages/coding-agent/examples/extensions/subagent). It adds background task management, shared agent-tree budgets, worktree patch handoffs, validated output contracts, steering, resumable sessions, and durable run history.
 
-Requires **Node.js 22.19+ and pi 0.86.0 or later** (type-checked and tested with pi **0.99.1 and 1.5.0**). Each worker runs in a separate pi RPC process. Worktrees separate checkouts; they are not an operating-system sandbox.
+Requires **Node.js 22.19+ and pi 0.86.0 or later**. Production entrypoints are checked against pi 0.86.0; the full development suite targets pi **0.99.1 and 1.5.0** (see compatibility notes below). Each worker runs in a separate pi RPC process. Worktrees separate checkouts; they are not an operating-system sandbox.
 
 ## Install
 
@@ -70,9 +70,16 @@ Use `/reload` after changes. These development installs refer to the checkout, w
 npm run check
 npm test
 npm run eval -- --check-fixtures
+npm run measure -- --repeats 3 --fanout 4
 ```
 
-Tests use temporary repositories and deterministic subprocesses, including a local provider running through the real pi CLI. They make no paid provider requests. Verification was run locally on Linux with Node 24.14.0 and pi 0.99.1/1.5.0; the advertised minimum Node/pi versions and other operating systems still need an automated compatibility matrix.
+Tests use temporary repositories and deterministic subprocesses, including a local provider running through the real pi CLI. These commands make no paid provider requests. The measurement command creates a private temporary configuration, never copies credentials, and reports startup/first-token/queue/delivery timings, active/parked RSS, event-loop delay, sampled I/O, and accounting/resource invariants. See [benchmark methodology](benchmarks/README.md) for definitions and limitations; synthetic reported costs are not provider bills.
+
+### Compatibility verification
+
+Local Linux verification covers Node **24.14.0** with pi **0.99.1/1.5.0**, and Node **22.19.0** with pi **0.99.1**. At the advertised pi **0.86.0** floor, production-source typechecking (`npm run check:production`) and a selected runtime smoke suite also pass on Node 22.19.0. The full development suite does **not** pass against that SDK: some fixtures deliberately exercise newer `executeTool`/`agent_before_settle` APIs. This distinction is not a claim of exhaustive minimum-version compatibility.
+
+`.github/workflows/checks.yml` defines a minimum-version smoke job and full-suite jobs for selected Linux/macOS/Windows, Node, and pi combinations. Those workflow definitions are not evidence of completed CI or non-Linux validation. POSIX-only fault/process-group tests remain platform-conditional.
 
 ## Execution
 
@@ -210,16 +217,18 @@ Delegation is available at depths 0–2; workers at depth 3 cannot delegate furt
 
 Worktrees start from **committed HEAD**; the parent's uncommitted changes are not copied. Git's common directory is resolved correctly for linked checkouts. A committed working subdirectory is preserved within the new checkout. Chain steps must remain inside the isolated repository.
 
-At completion, the extension exports a binary-capable patch against the starting commit using a temporary index. It includes worker commits, tracked modifications/deletions, and new non-ignored files without staging changes in the worker's real index. Ignored files and uncommitted changes inside submodule working directories are not copied into the patch. The worktree and branch are retained.
+At completion, the extension exports a binary-capable patch against the starting commit using a temporary index. It includes worker commits, tracked modifications/deletions, and new non-ignored files without staging changes in the worker's real index. Patch replacement uses a private temporary file and rename so a failed write does not replace a complete earlier handoff with partial bytes. Ignored files and uncommitted changes inside submodule working directories are not copied into the patch. The worktree and branch are retained. An export already in progress retains ownership and its process reservation until cleanup finishes, even if the caller cancels during that cleanup.
 
 Model-visible metadata points to:
 
 - `patch`: the integration artifact, when changes exist;
 - `baseCommit` and `changedFiles`: the change scope;
 - `manifest`: full artifact metadata and recorded bash command evidence;
-- `verification`: recent command names, error flags, and exit codes when available.
+- `verification`: shell-command evidence with run/attempt/call identity, optional parent-call identity, observed start/end/result flags, outcome, and an exit code only when actually reported.
 
-Recorded command output is evidence of what ran; it is not an independent certification that all acceptance criteria were tested. Each recorded output excerpt is capped at 8 KB; full tool-result messages remain in the run/session records. Long changed-file and command lists are summarized in the model response, with the full lists in the manifest.
+Verification captures direct and arbitrarily nested bash execution events, not the SDK's bounded `nestedCalls` summary. It reconciles direct transcript results after missing RPC events without merging retries or copied history. Outcomes distinguish `completed`, `error`, `cancelled`, and `incomplete`: a missing end/result never certifies success, and `completed` does not invent exit code zero. Nested evidence depends on the SDK emitting those events; transcript fallback cannot reconstruct nested output that was never persisted.
+
+Recorded output is evidence of what ran, not independent certification that all acceptance criteria were tested. Each excerpt is capped at **8 KiB UTF-8**; larger output has a stable artifact when available. `fullOutputComplete: false` and `outputError` expose partial/unavailable preservation. Evidence capture failures are recorded separately and never suppress message retention or usage recovery. Full evidence is retained in saved attempts/manifests; direct results also remain in native sessions. Long changed-file and command lists are summarized in the model response, with full lists in the manifest.
 
 Review the patch and verification output before integrating it in the target repository:
 
@@ -273,7 +282,7 @@ State lives under `~/.pi/agent/subagents-ex/` (or the configured `PI_CODING_AGEN
 | `worktrees/` | Individual worktree records and live ownership |
 | `artifacts/` | Patches and command-evidence manifests |
 
-New saves use **v3 append-only journals with small atomic checkpoints**. Existing v2 snapshots remain readable; the first save migrates them after installing and verifying an exact `.v2-backup`. Incomplete final journal writes can recover the preceding committed state; interior corruption/checksum failures fail closed. History listing never replays a v3 journal or reads its task sidecar.
+New saves use **v3 append-only journals with small atomic checkpoints**. Existing v2 snapshots remain readable; the first save migrates them after installing and verifying an exact `.v2-backup`. Incomplete final journal writes can recover the preceding committed state; interior corruption/checksum failures fail closed. History listing never replays a v3 journal or reads its task sidecar. Attempt verification uses changed-index journal patches rather than repeatedly embedding full excerpts in checkpoints; concurrent updates, legacy optional evidence, and full hydration remain supported.
 
 Pruning normally retains the newest **200 settled v3 records**, coordinating checkpoint, journal, task, and output deletion. Active/busy records are skipped; legacy snapshots and migration backups are preserved, so 200 is not a hard directory/file-count bound. Sessions, artifacts, task snapshots, budget ledgers, and crash-orphaned files remain until manually removed. They can contain source and tool output; plan retention and back up complete run file sets rather than individual checkpoint JSON files.
 
@@ -281,6 +290,8 @@ Run writes order file fsyncs, dependency publication, and atomic checkpoint rena
 
 ## Design and evaluation
 
-`plan.ts` normalizes and validates modes/options. `orchestrator.ts` executes all modes through the same `runner.ts` RPC engine. `scheduler.ts` coordinates resources; `child-guard.ts` enforces budgets inside pi. `tasks.ts`, `accounting.ts`, and `store.ts` handle background ownership, usage attribution, and persistence. `results.ts` bounds publication DTOs; `history-tools.ts` exposes paginated reads. `worktree.ts` exports patch handoffs. Presentation consumes these records through `render.ts` and `dashboard.ts`.
+`plan.ts` normalizes and validates modes/options. `orchestrator.ts` executes all modes through the same `runner.ts` RPC engine. `scheduler.ts` coordinates resources; `child-guard.ts` enforces budgets inside pi. `tasks.ts`, `accounting.ts`, and `store.ts` handle background ownership, usage attribution, and persistence. `verification.ts` reconciles shell evidence; `worktree.ts` exports patch handoffs. `results.ts` bounds publication DTOs; `history-tools.ts` exposes paginated reads. Presentation consumes these records through `render.ts` and `dashboard.ts`.
+
+For local instrumentation, `RunnerOptions.onEvent` receives lifecycle-only `RunnerEvent`s (`queued`, `admitted`, `spawned`, `prompt_sent`, `prompt_accepted`, `first_token`, `settled`, `finished`). Events carry exact run/attempt IDs, an optional child PID, and a same-dispatcher `performance.now()` timestamp. First-token events require a real text/thinking delta and occur at most once per attempt. Synchronous observer throws and returned promise rejections do not control execution; callbacks are not awaited and are not a durable event stream. No per-token telemetry is persisted.
 
 The [evaluation harness](benchmarks/README.md) compares direct work, the stock example, and this extension on repeatable fixtures, measuring task success, patch correctness, latency, tokens, and cost. Offline fixture checks and mocked integration tests establish mechanics. Live model comparisons are opt-in; no task-quality or cost advantage is claimed without those measurements.

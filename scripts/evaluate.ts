@@ -3,9 +3,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import { parseArgs } from "node:util";
+import {
+	loadCases, materializeCase, checkAcceptance, initializeTrial, checkIntegrity, checkedGit,
+	normalizeTrialUsage, trialBudgets, corpusDigest, fileIdentity, packageVersion,
+} from "./evaluation.ts";
 
 const { values } = parseArgs({
 	options: {
@@ -22,35 +24,12 @@ const { values } = parseArgs({
 	},
 });
 const corpus = fileURLToPath(new URL("../benchmarks/cases/", import.meta.url));
-const cases = fs
-	.readdirSync(corpus)
-	.sort()
-	.map(
-		(name) =>
-			({
-				...JSON.parse(fs.readFileSync(path.join(corpus, name, "task.json"), "utf8")),
-				dir: path.join(corpus, name),
-			}) as { id: string; task: string; dir: string },
-	);
-const execute = promisify(execFile);
-async function check(dir: string, cwd: string) {
-	try {
-		const result = await execute(process.execPath, [path.join(dir, "check.mjs")], {
-			cwd,
-			env: { ...process.env, EVAL_WORKSPACE: cwd },
-			timeout: 15000,
-		});
-		return { passed: true, output: result.stdout + result.stderr };
-	} catch (err) {
-		const e = err as { stdout?: string; stderr?: string; message: string };
-		return { passed: false, output: e.stdout || e.stderr || e.message };
-	}
-}
+const cases = loadCases(corpus);
 
 if (values.list || (!values.model && !values["check-fixtures"])) {
 	console.log(
 		JSON.stringify(
-			cases.map(({ id, task }) => ({ id, task })),
+			cases.map(({ id, task, allowlist }) => ({ id, task, allowlist })),
 			null,
 			2,
 		),
@@ -62,12 +41,18 @@ if (values.list || (!values.model && !values["check-fixtures"])) {
 	const cwd = fs.mkdtempSync(path.join(os.tmpdir(), "subagents-eval-fixtures-"));
 	try {
 		for (const task of cases) {
-			fs.copyFileSync(path.join(task.dir, "initial.mjs"), path.join(cwd, "lib.mjs"));
-			if ((await check(task.dir, cwd)).passed)
+			const initial = path.join(cwd, `${task.id}-initial`), reference = path.join(cwd, `${task.id}-reference`);
+			materializeCase(task, initial);
+			materializeCase(task, reference, true);
+			if ((await checkAcceptance(task, initial)).passed)
 				throw new Error(`${task.id}: initial implementation unexpectedly passes`);
-			fs.copyFileSync(path.join(task.dir, "solution.mjs"), path.join(cwd, "lib.mjs"));
-			const verified = await check(task.dir, cwd);
-			if (!verified.passed) throw new Error(`${task.id}: reference solution failed: ${verified.output}`);
+			const baseline = await initializeTrial(initial);
+			// Exercise the same scoped repository lifecycle as a live trial.
+			fs.cpSync(reference, initial, { recursive: true });
+			const verified = await checkAcceptance(task, initial);
+			const integrity = await checkIntegrity(initial, baseline, task.allowlist);
+			if (!verified.passed || !integrity.passed)
+				throw new Error(`${task.id}: reference solution failed: ${verified.output}\n${JSON.stringify(integrity)}`);
 			console.log(`${task.id}: initial fails; reference passes`);
 		}
 	} finally {
@@ -83,8 +68,8 @@ if (values.list || (!values.model && !values["check-fixtures"])) {
 	if (!Number.isFinite(maxCost) || maxCost <= 0 || maxCost > 100)
 		throw new Error("max-cost must be >0 and <=100 USD per trial");
 	const variants = values.variants!.split(",");
-	if (variants.some((v) => !["single", "stock", "extended"].includes(v)))
-		throw new Error("variants: single,stock,extended");
+	if (!variants.length || new Set(variants).size !== variants.length || variants.some((v) => !["single", "stock", "extended"].includes(v)))
+		throw new Error("variants must be a nonempty, unique list of: single,stock,extended");
 	if (variants.includes("stock") && !values.stock)
 		throw new Error("Pass --stock /path/to/pi/examples/extensions/subagent/index.ts, or --variants single,extended");
 	const out = path.resolve(values.out ?? `evaluation-${Date.now()}`);
@@ -109,7 +94,7 @@ if (values.list || (!values.model && !values["check-fixtures"])) {
 		);
 		const { Runner } = await import("../src/runner.ts");
 		const { Scheduler } = await import("../src/scheduler.ts");
-		const { git } = await import("../src/worktree.ts");
+		const sdkEntry = fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"));
 		const cli = path.join(
 			path.dirname(fileURLToPath(import.meta.resolve("@earendil-works/pi-coding-agent"))),
 			"bundle/cli.js",
@@ -124,25 +109,40 @@ if (values.list || (!values.model && !values["check-fixtures"])) {
 			cost: number;
 			tokens: number;
 			status: string;
+			accountingComplete: boolean;
 		}> = [];
-		const checkedGit = async (args: string[], cwd: string) => {
-			const r = await git(args, cwd);
-			if (r.code) throw new Error(r.stderr);
-			return r.stdout;
-		};
+		const evaluatorRoot = fileURLToPath(new URL("../", import.meta.url));
+		const metadata = Object.freeze({
+			schemaVersion: 2, createdAt: new Date().toISOString(), model: values.model,
+			node: process.version, platform: process.platform, arch: process.arch,
+			gitVersion: (await checkedGit(["--version"], evaluatorRoot)).trim(),
+			piVersion: packageVersion(sdkEntry, "@earendil-works/pi-coding-agent"),
+			evaluatorCommit: (await checkedGit(["rev-parse", "HEAD"], evaluatorRoot)).trim(),
+			evaluatorDirty: (await checkedGit(["status", "--porcelain", "-z"], evaluatorRoot)).length > 0,
+			evaluatorFiles: ["evaluate.ts", "evaluation.ts"].map((f) => fileIdentity(path.join(evaluatorRoot, "scripts", f))),
+			corpusSha256: corpusDigest(corpus),
+			implementationSha256: corpusDigest(path.join(evaluatorRoot, "src")),
+			stock: values.stock ? { ...fileIdentity(path.resolve(values.stock)), treeSha256: corpusDigest(path.dirname(path.resolve(values.stock))) } : null,
+			providerExtensions: (values["provider-extension"] ?? []).map((f) => fileIdentity(path.resolve(f))),
+			settings: { retry: false, compaction: false, skills: false, contextFiles: false, thinking: "SDK default" },
+			modelsConfigSha256: fs.existsSync(path.join(config, "models.json")) ? fileIdentity(path.join(config, "models.json")).sha256 : null,
+			usagePolicy: "stock details.results reconstructed once; SDK totals are a floor; extended managed totals unchanged",
+		});
+		fs.writeFileSync(path.join(out, "manifest.json"), JSON.stringify(metadata, null, 2), { mode: 0o400, flag: "wx" });
 		for (let repeat = 1; repeat <= repeats; repeat++)
 			for (const task of cases)
 				for (const variant of variants) {
 					const name = `${task.id}-${variant}-${repeat}`;
 					const cwd = path.join(out, name);
-					fs.mkdirSync(cwd);
-					fs.copyFileSync(path.join(task.dir, "initial.mjs"), path.join(cwd, "lib.mjs"));
-					await checkedGit(["init", "--initial-branch=main"], cwd);
-					await checkedGit(["add", "."], cwd);
-					await checkedGit(
-						["-c", "user.name=Evaluation", "-c", "user.email=evaluation@example.invalid", "commit", "-m", "fixture"],
-						cwd,
-					);
+					materializeCase(task, cwd);
+					const baseline = await initializeTrial(cwd);
+					const budgets = trialBudgets(variant, timeout, maxCost);
+					const prompt = `${task.task}\n${variant === "single" ? "Implement this directly." : "Use the subagent tool to delegate implementation to worker. Review its changes before finishing."}`;
+					const systemPrompt = `Complete the requested repository task and verify it. Only these exact paths may change: ${task.allowlist.join(", ")}.`;
+					const trialManifest = Object.freeze({ ...metadata, name, variant, repeat, task: task.id,
+						prompt, systemPrompt, allowlist: task.allowlist, baseline, budgets });
+					// Record before spawning; validation retains this object, never a worker-editable HEAD/file.
+					fs.writeFileSync(path.join(out, `${name}.manifest.json`), JSON.stringify(trialManifest, null, 2), { mode: 0o400, flag: "wx" });
 					const extensions = [
 						...(values["provider-extension"] ?? []).map((f) => path.resolve(f)),
 						...(variant === "extended" ? [extension] : variant === "stock" ? [path.resolve(values.stock!)] : []),
@@ -165,43 +165,40 @@ if (values.list || (!values.model && !values["check-fixtures"])) {
 							description: "Evaluation dispatcher",
 							source: "user",
 							filePath: "evaluation",
-							systemPrompt: "Complete the requested repository task and verify it. Only lib.mjs may change.",
+							systemPrompt,
 							model: values.model!,
 							skills: false,
 							contextFiles: false,
 							extensions: false,
 						},
-						`${task.task}\n${variant === "single" ? "Implement this directly." : "Use the subagent tool to delegate implementation to worker. Review its changes before finishing."}`,
-						{ timeoutSeconds: timeout, maxTurns: 20, maxCost },
+						prompt,
+						budgets.root,
 					);
 					const latencyMs = Date.now() - started;
-					const verification = await check(task.dir, cwd);
-					const diffCheck = await git(["diff", "--check", "HEAD"], cwd);
-					const changed = (await checkedGit(["diff", "--name-only", "HEAD"], cwd)).trim().split("\n").filter(Boolean);
-					const untracked = (await checkedGit(["ls-files", "--others", "--exclude-standard"], cwd)).trim();
-					const success =
-						run.status === "ok" &&
-						verification.passed &&
-						diffCheck.code === 0 &&
-						changed.every((f) => f === "lib.mjs") &&
-						!untracked;
+					const verification = await checkAcceptance(task, cwd);
+					const integrity = await checkIntegrity(cwd, baseline, task.allowlist);
+					const accounting = normalizeTrialUsage(run, variant);
+					const measured = accounting.normalized;
+					const success = run.status === "ok" && verification.passed && integrity.passed;
 					rows.push({
 						variant,
 						task: task.id,
 						repeat,
 						success: Boolean(success),
 						latencyMs,
-						cost: run.usage.cost,
-						tokens: run.usage.input + run.usage.output + run.usage.cacheRead + run.usage.cacheWrite,
+						cost: measured.cost,
+						tokens: measured.input + measured.output + measured.cacheRead + measured.cacheWrite,
 						status: run.status,
+						accountingComplete: accounting.complete,
 					});
+					for (const warning of accounting.warnings) console.warn(`${name}: USAGE INCOMPLETE: ${warning}`);
 					fs.writeFileSync(
 						path.join(out, `${name}.json`),
-						JSON.stringify({ model: values.model, run, verification, diffCheck, changed, untracked }, null, 2),
+						JSON.stringify({ manifest: trialManifest, run, accounting, verification, integrity }, null, 2),
 						{ mode: 0o600 },
 					);
 					console.log(
-						`${name}: ${success ? "PASS" : "FAIL"} ${(latencyMs / 1000).toFixed(1)}s $${run.usage.cost.toFixed(4)}`,
+						`${name}: ${success ? "PASS" : "FAIL"} ${(latencyMs / 1000).toFixed(1)}s $${measured.cost.toFixed(4)}`,
 					);
 				}
 		const summary = variants.map((variant) => {
@@ -212,15 +209,19 @@ if (values.list || (!values.model && !values["check-fixtures"])) {
 				trials: trials.length,
 				successes: trials.filter((r) => r.success).length,
 				successRate: trials.filter((r) => r.success).length / trials.length,
-				meanCost: avg("cost"),
+				usageIncompleteTrials: trials.filter((r) => !r.accountingComplete).length,
+				meanCost: trials.every((r) => r.accountingComplete) ? avg("cost") : null,
+				meanObservedCost: avg("cost"),
 				meanLatencyMs: avg("latencyMs"),
-				meanTokens: avg("tokens"),
+				meanTokens: trials.every((r) => r.accountingComplete) ? avg("tokens") : null,
 			};
 		});
-		fs.writeFileSync(path.join(out, "summary.json"), JSON.stringify({ model: values.model, rows, summary }, null, 2), {
+		fs.writeFileSync(path.join(out, "summary.json"), JSON.stringify({ metadata, rows, summary,
+			budgets: Object.fromEntries(variants.map((v) => [v, trialBudgets(v, timeout, maxCost)])) }, null, 2), {
 			mode: 0o600,
 		});
-		fs.cpSync(path.join(config, "subagents-ex"), path.join(out, "state"), { recursive: true });
+		if (fs.existsSync(path.join(config, "subagents-ex")))
+			fs.cpSync(path.join(config, "subagents-ex"), path.join(out, "state"), { recursive: true });
 		console.table(summary);
 	} finally {
 		fs.rmSync(config, { recursive: true, force: true });

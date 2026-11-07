@@ -1,0 +1,8 @@
+{
+  "id": "scoreboard-report",
+  "task": "Repair this dependency-free scoreboard repository. Edit only src/config.mjs and src/report.mjs. resolveConfig(fileConfig = {}, env = {}, flags = {}) must return {title, minScore, includeInactive}, with per-option precedence flags > environment > file config > defaults (Scoreboard, 0, false). Environment names are SCOREBOARD_TITLE, SCOREBOARD_MIN_SCORE, SCOREBOARD_INCLUDE_INACTIVE; parse environment scores as nonempty finite nonnegative numbers and environment booleans as exactly 'true' or 'false'. File/flag scores must be finite nonnegative numbers and booleans must be booleans. Validate effective values (title must be a string); explicit empty title, zero and false override lower layers. Ignore unrelated keys and do not mutate inputs. renderReport(records, options) must filter score >= minScore, exclude inactive records unless includeInactive is true, sort by descending numeric score then ascending name (JS string comparison), and return title followed by one 'name: score' line per match, or '(no matches)', with a final newline. Do not mutate records or options. Keep the existing CLI working with combined config, environment and flags. The CLI, config/report.json, and fixtures/players.json are protected: leave them byte-for-byte unchanged. Add no dependencies.",
+  "allowlist": [
+    "src/config.mjs",
+    "src/report.mjs"
+  ]
+}

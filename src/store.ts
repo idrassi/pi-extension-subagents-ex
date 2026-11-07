@@ -47,7 +47,10 @@ export function runOutputFile(id: string): string {
 	return path.join(RUNS_DIR, `${id}.output.txt`);
 }
 
-type AttemptMetadata = Omit<AttemptRecord, "messages" | "diagnostics" | "stderr">;
+// The optional verification field is read-only compatibility for older v3 checkpoints.
+// New checkpoints strip it; evidence is an incremental, checksummed attempt stream.
+type AttemptMetadata = Omit<AttemptRecord, "messages" | "diagnostics" | "stderr" | "verification"> &
+	Pick<AttemptRecord, "verification">;
 type RecordMetadata = Omit<RunRecord, "messages" | "stderr" | "attemptHistory" | "parsedOutput" | "artifacts" | "task" | "outputSchema">;
 interface CheckpointData {
 	record: RecordMetadata;
@@ -76,12 +79,16 @@ interface Stream {
 	messages: RunRecord["messages"];
 	diagnostics: string[];
 	stderr: string;
+	/** Absent and explicitly empty legacy evidence remain distinct. */
+	verification?: AttemptRecord["verification"];
 }
 interface StreamChange {
 	stream: string;
 	messages?: { offset: number; values: RunRecord["messages"] };
 	diagnostics?: { offset: number; values: string[] };
 	stderr?: { offset: number; value: string };
+	/** Null removes the optional evidence field; [] is still an observed empty stream. */
+	verification?: { length: number; updates: { index: number; value: NonNullable<AttemptRecord["verification"]>[number] }[] } | null;
 }
 type ValueKey = "parsedOutput" | "artifacts" | "outputSchema";
 interface ValueChange {
@@ -247,15 +254,32 @@ function readTask(data: CheckpointData): string {
 function applyChange(streams: Map<string, Stream>, change: StreamChange): void {
 	if (!validStream(change.stream)) throw new Error("Invalid transcript stream");
 	const stream = streams.get(change.stream) ?? emptyStream();
+	if (change.verification === null) delete stream.verification;
+	else if (change.verification !== undefined) {
+		const { length, updates } = change.verification;
+		const target = stream.verification ?? [];
+		if (!Number.isSafeInteger(length) || length < 0 || !Array.isArray(updates)) throw new Error("Invalid verification patch");
+		let previous = -1, appended = target.length;
+		for (const update of updates) {
+			if (!update || !Number.isSafeInteger(update.index) || update.index <= previous || update.index >= length)
+				throw new Error("Invalid verification index");
+			if (update.index >= target.length && update.index !== appended++) throw new Error("Missing verification append");
+			previous = update.index;
+		}
+		if (length > target.length && appended !== length) throw new Error("Missing verification append");
+		target.length = length;
+		for (const { index, value } of updates) target[index] = value;
+		stream.verification = target;
+	}
 	for (const key of ["messages", "diagnostics"] as const) {
 		const patch = change[key];
 		if (!patch) continue;
-		if (!Number.isSafeInteger(patch.offset) || patch.offset < 0 || patch.offset > stream[key].length ||
+		const target: unknown[] = stream[key];
+		if (!Number.isSafeInteger(patch.offset) || patch.offset < 0 || patch.offset > target.length ||
 			!Array.isArray(patch.values)) throw new Error("Invalid transcript offset");
 		if (key === "diagnostics" && !patch.values.every((v) => typeof v === "string")) throw new Error("Invalid diagnostic");
 		// These replay arrays are private, validated state. Keep the prefix in place:
 		// copying it on every append makes replay quadratic in accumulated elements.
-		const target: unknown[] = stream[key];
 		target.length = patch.offset;
 		for (const value of patch.values) target.push(value); // No argument-count limit on large suffixes.
 	}
@@ -338,11 +362,28 @@ function streamChange(name: string, before: Stream, after: Partial<Stream>): Str
 	const change: StreamChange = { stream: name };
 	if (after.messages) change.messages = arrayChange(before.messages, after.messages);
 	if (after.diagnostics) change.diagnostics = arrayChange(before.diagnostics, after.diagnostics);
+	if (Object.hasOwn(after, "verification")) {
+		if (after.verification === undefined) {
+			if (before.verification !== undefined) change.verification = null;
+		} else {
+			// Unlike messages, an early long-running command can change while later
+			// commands append/settle. Persist only changed indexes, never its whole suffix.
+			const prior = before.verification ?? [];
+			const updates: NonNullable<StreamChange["verification"]>["updates"] = [];
+			for (let index = 0; index < after.verification.length; index++) {
+				const value = after.verification[index];
+				if (index >= prior.length || !Object.is(prior[index], value) && !isDeepStrictEqual(prior[index], value))
+					updates.push({ index, value });
+			}
+			if (updates.length || before.verification === undefined || prior.length !== after.verification.length)
+				change.verification = { length: after.verification.length, updates };
+		}
+	}
 	if (after.stderr !== undefined && after.stderr !== before.stderr) {
 		const offset = after.stderr.startsWith(before.stderr) ? before.stderr.length : 0;
 		change.stderr = { offset, value: after.stderr.slice(offset) };
 	}
-	return change.messages || change.diagnostics || change.stderr ? change : undefined;
+	return change.messages || change.diagnostics || change.stderr || change.verification !== undefined ? change : undefined;
 }
 function checkpointData(record: RunRecord): CheckpointData {
 	// Strip both transcript fields and derived fields when the input is a loaded StoredRun.
@@ -358,7 +399,7 @@ function checkpointData(record: RunRecord): CheckpointData {
 	return {
 		record: metadata, taskFile: `${record.id}.${hash(task)}.task.txt`,
 		...(attemptHistory === undefined ? {} : { attemptHistory: attemptHistory.map(({ messages: _messages,
-			diagnostics: _diagnostics, stderr: _stderr, ...attempt }) => attempt) }),
+			diagnostics: _diagnostics, stderr: _stderr, verification: _verification, ...attempt }) => attempt) }),
 		messageStream, stderrStream, ts: record.startedAt,
 		durationMs: (record.endedAt ?? Date.now()) - record.startedAt,
 	};
@@ -396,7 +437,9 @@ export function saveRun(record: RunRecord): void {
 			const change = streamChange(name, state!.streams.get(name) ?? emptyStream(), after);
 			if (change) changes.push(change);
 		};
-		for (const [i, attempt] of (record.attemptHistory ?? []).entries()) add(`attempt-${i}`, attempt);
+		for (const [i, attempt] of (record.attemptHistory ?? []).entries()) add(`attempt-${i}`, {
+			messages: attempt.messages, diagnostics: attempt.diagnostics, stderr: attempt.stderr, verification: attempt.verification,
+		});
 		add("run", {
 			...(data.messageStream === "run" ? { messages: record.messages } : {}),
 			...(data.stderrStream === "run" ? { stderr: record.stderr } : {}),

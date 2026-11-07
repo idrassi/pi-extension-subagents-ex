@@ -3,11 +3,11 @@ import test, { beforeEach, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import * as path from "node:path";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { execFileSync } from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
 import type { Message } from "@earendil-works/pi-ai";
-import { newRunRecord, emptyUsage, type AttemptRecord, type RunRecord } from "../src/types.ts";
+import { newRunRecord, emptyUsage, type AttemptRecord, type RunRecord, type VerificationEvidence } from "../src/types.ts";
 import { getDisplayItems, getFinalOutput } from "../src/format.ts";
 import {
 	RUNS_DIR, getRunOutputPage, listRuns, listRunsPage, loadRun, loadRunById, runFile, runOutputFile, saveRun,
@@ -213,6 +213,171 @@ test("100 repeated 48 KiB messages append roughly linearly; checkpoints never se
 	assert.ok(fs.statSync(file).size - before < 4096);
 	assert.equal(loadRunById(run.id)!.messages.length, 100);
 	t.diagnostic(`48 KiB x100: ${sizes[99]} appended journal bytes; halves ${firstHalf}/${secondHalf}; checkpoint ${fs.statSync(runFile(run.id)).size} bytes`);
+});
+
+test("100 appended 8 KiB verification entries use linear suffix changes and small checkpoints", (t) => {
+	const run = record();
+	const current = attempt(1);
+	current.verification = [];
+	run.attempts = 1;
+	run.attemptHistory = [current];
+	run.messages = current.messages;
+	const payload = "VERIFICATION-PAYLOAD" + "v".repeat(8192 - "VERIFICATION-PAYLOAD".length);
+	const sizes: number[] = [];
+	for (let i = 0; i < 100; i++) {
+		current.verification.push({ runId: run.id, attempt: 1, toolCallId: `same/${i}`, parentToolCallId: `parent/${i % 3}`,
+			command: `check ${i}`, output: payload, outcome: "completed", endObserved: true, exitCode: i % 2 });
+		saveRun(run);
+		sizes.push(fs.statSync(journal(run)).size);
+	}
+	assert.ok(fs.statSync(runFile(run.id)).size < 4096, "verification bulk must not be in checkpoint metadata");
+	assert.ok(!fs.readFileSync(runFile(run.id), "utf8").includes("VERIFICATION-PAYLOAD"));
+	const firstHalf = sizes[49] - sizes[0];
+	const secondHalf = sizes[99] - sizes[49];
+	assert.ok(secondHalf / firstHalf < 1.1, `nonlinear verification append growth: ${secondHalf / firstHalf}`);
+	assert.ok(sizes[99] < 100 * 11 * 1024, `verification journal amplification: ${sizes[99]}`);
+	const lines = fs.readFileSync(journal(run), "utf8").trimEnd().split("\n").map((line) => JSON.parse(line).data);
+	for (let i = 0; i < lines.length; i++) {
+		assert.equal(lines[i].checkpoint.attemptHistory[0].verification, undefined);
+		const patch = lines[i].changes.find((change: any) => change.stream === "attempt-0").verification;
+		assert.equal(patch.length, i + 1);
+		assert.deepEqual(patch.updates, [{ index: i, value: current.verification[i] }]);
+	}
+	assert.deepEqual(loadRunById(run.id)!.attemptHistory, run.attemptHistory);
+	const before = fs.statSync(journal(run)).size;
+	const stringify = JSON.stringify;
+	const spy = mock.method(JSON, "stringify", (...args: any[]) => {
+		const text = (stringify as any)(...args);
+		assert.ok(!text?.includes(payload), "an unchanged save rewrote accumulated verification evidence");
+		return text;
+	});
+	try { withoutJournalReads(() => saveRun(run), true); } finally { spy.mock.restore(); }
+	assert.ok(fs.statSync(journal(run)).size - before < 4096);
+	const hydrated = loadRunById(run.id)!;
+	withoutJournalReads(() => saveRun(hydrated), true);
+	assert.deepEqual(loadRunById(run.id)!.attemptHistory, run.attemptHistory);
+	t.diagnostic(`8 KiB x100 verification: ${sizes[99]} journal bytes; halves ${firstHalf}/${secondHalf}; checkpoint ${fs.statSync(runFile(run.id)).size} bytes`);
+});
+
+test("100 saves mutate the first 8 KiB evidence while appending 8 KiB evidence without suffix amplification", (t) => {
+	const run = record();
+	const current = attempt(1);
+	current.verification = [{ command: "long-running first", output: "initial" }];
+	run.attemptHistory = [current];
+	const sizes: number[] = [];
+	for (let i = 0; i < 100; i++) {
+		current.verification[0].output = `${i}:` + "m".repeat(8192);
+		current.verification.push({ command: `concurrent ${i}`, output: "a".repeat(8192), toolCallId: `call-${i}` });
+		saveRun(run);
+		sizes.push(fs.statSync(journal(run)).size);
+	}
+	const firstHalf = sizes[49] - sizes[0], secondHalf = sizes[99] - sizes[49];
+	t.diagnostic(`mutating/appending 8 KiB x100: ${sizes[99]} journal bytes; halves ${firstHalf}/${secondHalf}`);
+	assert.ok(secondHalf / firstHalf < 1.1, `mutable verification suffix amplification: ${secondHalf / firstHalf}`);
+	assert.ok(sizes[99] < 100 * 20 * 1024, `mutable verification journal amplification: ${sizes[99]}`);
+	const transactions = fs.readFileSync(journal(run), "utf8").trimEnd().split("\n").map((line) => JSON.parse(line).data);
+	for (let i = 0; i < transactions.length; i++) {
+		const patch = transactions[i].changes.find((change: any) => change.stream === "attempt-0").verification;
+		assert.equal(patch.length, i + 2);
+		assert.deepEqual(patch.updates.map((update: any) => update.index), [0, i + 1]);
+	}
+	const hydrated = loadRunById(run.id)!;
+	assert.deepEqual(hydrated.attemptHistory, run.attemptHistory);
+	const before = fs.statSync(journal(run)).size;
+	withoutJournalReads(() => saveRun(hydrated), true);
+	assert.ok(fs.statSync(journal(run)).size - before < 4096);
+	// Reordering, deletion and replacement of the caller's array must round-trip too.
+	hydrated.attemptHistory![0].verification = [current.verification[100], current.verification[0]];
+	saveRun(hydrated);
+	assert.deepEqual(loadRunById(run.id)!.attemptHistory, hydrated.attemptHistory);
+});
+
+test("verification streams retain exact identities, in-place edits, empty/absent legacy fields and artifacts", () => {
+	const run = record();
+	const evidence: VerificationEvidence[] = [
+		{ command: "legacy optional identity", output: "old output" },
+		{ runId: run.id, attempt: 1, toolCallId: "reused", parentToolCallId: "parent/one", command: "one", output: "first" },
+		{ runId: run.id, attempt: 1, toolCallId: "reused", parentToolCallId: "parent/two", command: "two", output: "second" },
+	];
+	run.attemptHistory = [attempt(1), attempt(2), attempt(3)];
+	run.attemptHistory[0].verification = evidence;
+	run.attemptHistory[1].verification = [];
+	run.artifacts = { changedFiles: [], verification: evidence };
+	saveRun(run);
+	assert.deepEqual(loadRunById(run.id)!.attemptHistory, run.attemptHistory);
+	assert.deepEqual(loadRunById(run.id)!.artifacts, run.artifacts);
+	evidence[1].output = "edited in place";
+	evidence.pop();
+	run.attemptHistory[1].verification = undefined;
+	run.attemptHistory[2].verification = [];
+	saveRun(run);
+	const loaded = loadRunById(run.id)!;
+	assert.deepEqual(loaded.attemptHistory, JSON.parse(JSON.stringify(run.attemptHistory)));
+	assert.deepEqual(loaded.artifacts, run.artifacts);
+	assert.equal(Object.hasOwn(loaded.attemptHistory![1], "verification"), false);
+	assert.deepEqual(loaded.attemptHistory![2].verification, []);
+});
+
+test("v2 and legacy v3 checkpoint verification hydrate and migrate once without rewriting evidence", () => {
+	for (const version of [2, 3]) {
+		const run = record();
+		run.attemptHistory = [attempt(1), attempt(2), attempt(3)];
+		run.attemptHistory[0].verification = [{ command: "legacy evidence", output: "legacy".repeat(1500) },
+			{ runId: run.id, attempt: 1, toolCallId: "exact", parentToolCallId: "parent", command: "modern identity", output: "exact" }];
+		run.attemptHistory[1].verification = [];
+		if (version === 2) legacy(run);
+		else {
+			saveRun(run);
+			// Construct a checksummed pre-stream v3 transaction/checkpoint, independent of the current writer format.
+			const disk = checkpoint(run);
+			const tx = JSON.parse(fs.readFileSync(journal(run), "utf8").trim()).data;
+			for (const change of tx.changes) delete change.verification;
+			for (let i = 0; i < 2; i++) tx.checkpoint.attemptHistory[i].verification = run.attemptHistory[i].verification;
+			disk.attemptHistory = tx.checkpoint.attemptHistory;
+			const checksum = createHash("sha256").update(JSON.stringify(tx)).digest("hex");
+			const line = JSON.stringify({ checksum, data: tx }) + "\n";
+			fs.writeFileSync(journal(run), line);
+			disk.journal.hash = checksum;
+			disk.journal.bytes = Buffer.byteLength(line);
+			fs.writeFileSync(runFile(run.id), JSON.stringify(disk));
+		}
+		const loaded = loadRunById(run.id)!;
+		assert.deepEqual(loaded.attemptHistory, run.attemptHistory, `v${version}`);
+		saveRun(loaded);
+		assert.ok(checkpoint(run).attemptHistory.every((entry: any) => !Object.hasOwn(entry, "verification")));
+		assert.deepEqual(loadRunById(run.id)!.attemptHistory, run.attemptHistory);
+		const before = fs.statSync(journal(run)).size;
+		saveRun(loaded);
+		assert.ok(fs.statSync(journal(run)).size - before < 4096, `v${version} migrated evidence was rewritten`);
+	}
+});
+
+test("verification stream changes share checkpoint publication and coherent torn-tail recovery", () => {
+	const run = record();
+	const current = attempt(1);
+	current.verification = [{ command: "committed", output: "committed evidence" }];
+	run.attemptHistory = [current];
+	saveRun(run);
+	const file = journal(run);
+	const prefix = fs.statSync(file).size;
+	current.verification[0].output = "edited evidence";
+	current.verification.push({ command: "pending", output: "pending evidence" });
+	const rename = fs.renameSync;
+	const fail = mock.method(fs, "renameSync", (from: any, to: any) => {
+		if (String(to) === runFile(run.id)) throw new Error("injected verification checkpoint failure");
+		return rename(from, to);
+	});
+	syncBuiltinESMExports();
+	try { assert.throws(() => saveRun(run), /injected verification/); }
+	finally { fail.mock.restore(); syncBuiltinESMExports(); }
+	assert.deepEqual(loadRunById(run.id)!.attemptHistory![0].verification, [{ command: "committed", output: "committed evidence" }]);
+	saveRun(run);
+	assert.deepEqual(loadRunById(run.id)!.attemptHistory![0].verification, current.verification);
+	fs.truncateSync(file, prefix + Math.floor((fs.statSync(file).size - prefix) / 2));
+	const recovered = loadRunById(run.id)!;
+	assert.deepEqual(recovered.attemptHistory![0].verification, [{ command: "committed", output: "committed evidence" }]);
+	saveRun(recovered);
+	assert.deepEqual(loadRunById(run.id)!.attemptHistory![0].verification, recovered.attemptHistory![0].verification);
 });
 
 test("a separate process loads and saves without duplicating transcripts", () => {

@@ -80,7 +80,14 @@ export async function exportPatch(info: WorktreeInfo, runId: string): Promise<Ru
 		if (!changedFiles.length) return { changedFiles, baseCommit, verification: [] };
 		const patch = path.join(ARTIFACTS_DIR, `${runId}.patch`);
 		const diff = await checkedGit(["diff", "--cached", "--binary", "--full-index", baseCommit, "--"], info.path, env);
-		fs.writeFileSync(patch, diff, { mode: 0o600 });
+		// Never publish a short write or destroy an earlier complete handoff.
+		const temporary = `${patch}.${randomUUID()}.tmp`;
+		try {
+			fs.writeFileSync(temporary, diff, { mode: 0o600, flag: "wx" });
+			fs.renameSync(temporary, patch);
+		} finally {
+			fs.rmSync(temporary, { force: true });
+		}
 		return { patch, changedFiles, baseCommit, verification: [] };
 	} finally {
 		fs.rmSync(index, { force: true });

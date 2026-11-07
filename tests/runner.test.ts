@@ -1,12 +1,14 @@
 import { agent, defaults } from "./setup.ts";
-import test from "node:test";
+import test, { mock } from "node:test";
 import assert from "node:assert/strict";
-import * as fs from "node:fs";
+import fs from "node:fs";
+import { syncBuiltinESMExports } from "node:module";
 import { fileURLToPath } from "node:url";
 import { setTimeout as delay } from "node:timers/promises";
-import { Runner, type RunnerOptions } from "../src/runner.ts";
+import { Runner, type RunnerEvent, type RunnerOptions } from "../src/runner.ts";
 import { Scheduler } from "../src/scheduler.ts";
 import { getFinalOutput } from "../src/format.ts";
+import { VerificationCollector } from "../src/verification.ts";
 import { loadRunById } from "../src/store.ts";
 
 const runnerFor = (scenario: string, options: RunnerOptions = {}) =>
@@ -219,4 +221,183 @@ test("resuming copies session history and charges only the new work", async () =
 	assert.equal(getFinalOutput(second.messages), "history=1");
 	assert.equal(second.usage.cost, 0.1);
 	assert.equal(fs.readFileSync(first.sessionFile!, "utf8"), original);
+});
+
+const telemetryRunner = (scenario: string, options: RunnerOptions = {}) => new Runner({
+	invocation: { command: process.execPath,
+		prefix: [fileURLToPath(new URL("./fixtures/verification-peer.mjs", import.meta.url)), scenario] },
+	killGraceMs: 100,
+	...options,
+});
+
+test("evidence publication EACCES never loses session-only or live usage/messages", { timeout: 15000 }, async () => {
+	for (const scenario of ["accounting-session-crash", "accounting-live", "accounting-live-event"]) {
+		const runner = telemetryRunner(scenario, { onEvent: async () => { throw new Error("observational rejection"); } });
+		const rename = fs.renameSync;
+		let failures = 0;
+		const fail = mock.method(fs, "renameSync", (from: any, to: any) => {
+			if (failures === 0 && /-bash-.*\.txt$/.test(String(to))) {
+				failures++;
+				throw Object.assign(new Error("injected verification EACCES"), { code: "EACCES" });
+			}
+			return rename(from, to);
+		});
+		syncBuiltinESMExports();
+		let run;
+		try {
+			run = await runner.run(defaults, agent, "accounting despite evidence failure", {}, undefined, undefined,
+				() => { throw new Error("presentation observer failed"); });
+		} finally { fail.mock.restore(); syncBuiltinESMExports(); }
+		assert.equal(failures, 1, scenario);
+		assert.equal(run.status, scenario === "accounting-session-crash" ? "error" : "ok", run.errorMessage);
+		assert.equal(run.messages.length, 3, `${scenario}: later messages must survive`);
+		assert.equal(getFinalOutput(run.messages), "accounted after evidence failure");
+		assert.ok(Math.abs(run.usage.cost - 0.03) < 1e-9, `${scenario}: run cost ${run.usage.cost}`);
+		const saved = loadRunById(run.id)!;
+		assert.deepEqual(saved.messages, run.messages);
+		assert.equal(saved.usage.cost, run.usage.cost);
+		const evidence = saved.attemptHistory![0].verification![0];
+		assert.match(evidence.outputError!, /injected verification EACCES/);
+		assert.equal(evidence.fullOutputPath, undefined, "a failed publication is not an artifact");
+		assert.notEqual(evidence.fullOutputComplete, true);
+		assert.equal(evidence.exitCode, 0, "the actually observed terminal result remains evidence");
+		assert.deepEqual(saved.artifacts!.verification, [evidence]);
+		assert.deepEqual(JSON.parse(fs.readFileSync(saved.artifacts!.manifest!, "utf8")).verification, [evidence]);
+		const snapshot = await runner.scheduler.snapshot();
+		assert.ok(Math.abs(snapshot.cost - 0.03) < 1e-9, `${scenario}: tree cost ${snapshot.cost}`);
+		assert.deepEqual(snapshot.leases, []);
+	}
+});
+
+test("unexpected evidence observers do not skip live accounting and rejected recovery scans can retry", { timeout: 10000 }, async () => {
+	const observe = VerificationCollector.prototype.observeMessage;
+	let failures = 0;
+	const fail = mock.method(VerificationCollector.prototype, "observeMessage", function (this: VerificationCollector, message: any) {
+		if (message.role === "toolResult" && failures++ === 0) throw new Error("injected evidence observer failure");
+		return observe.call(this, message);
+	});
+	const live = telemetryRunner("accounting-live");
+	let run;
+	try { run = await live.run(defaults, agent, "observer failure"); } finally { fail.mock.restore(); }
+	assert.equal(run.status, "ok", run.errorMessage);
+	assert.equal(run.messages.length, 3);
+	assert.ok(Math.abs(run.usage.cost - 0.03) < 1e-9);
+	assert.ok(run.attemptHistory![0].diagnostics.some((message) => /injected evidence observer failure/.test(message)));
+	assert.ok(Math.abs((await live.scheduler.snapshot()).cost - 0.03) < 1e-9);
+
+	const session = telemetryRunner("accounting-session-crash");
+	const add = session.scheduler.addUsage.bind(session.scheduler);
+	let rejected = false;
+	const rejectOnce = mock.method(session.scheduler, "addUsage", async (...args: Parameters<Scheduler["addUsage"]>) => {
+		if (!rejected) { rejected = true; throw new Error("injected recover ledger rejection"); }
+		return add(...args);
+	});
+	try { run = await session.run(defaults, agent, "recovery retry"); } finally { rejectOnce.mock.restore(); }
+	assert.equal(rejected, true);
+	assert.equal(run.status, "error");
+	assert.equal(run.messages.length, 3);
+	assert.ok(Math.abs(run.usage.cost - 0.03) < 1e-9, `recovery remained poisoned: ${run.usage.cost}`);
+	assert.ok(Math.abs((await session.scheduler.snapshot()).cost - 0.03) < 1e-9);
+});
+
+test("optional telemetry is ordered on RPC arrival and finishes only after cleanup and final persistence", async () => {
+	const events: RunnerEvent[] = [];
+	let savedAtFinish = false;
+	const runner = telemetryRunner("telemetry-stream", { onEvent: (event) => {
+		events.push(event);
+		if (event.type === "finished") {
+			const saved = loadRunById(event.runId)!;
+			savedAtFinish = saved.status === "ok" && !!saved.endedAt && fs.existsSync(saved.artifacts!.manifest!) &&
+				fs.existsSync(saved.artifacts!.output!);
+		}
+	} });
+	const run = await runner.run(defaults, agent, "timings");
+	assert.equal(run.status, "ok", run.errorMessage);
+	assert.equal(savedAtFinish, true);
+	assert.deepEqual(events.map((event) => event.type), ["queued", "admitted", "spawned", "prompt_sent", "prompt_accepted",
+		"first_token", "settled", "finished"]);
+	assert.ok(events.every((event, i) => event.runId === run.id && Number.isFinite(event.at) &&
+		(i === 0 || event.at >= events[i - 1].at)));
+	assert.ok(events.slice(2).every((event) => event.attempt === 1 && event.pid === run.childPid));
+	assert.ok(events.at(-1)!.at - events.at(-2)!.at >= 30, "settled must precede the delayed statistics await");
+	assert.deepEqual((await runner.scheduler.snapshot()).leases, []);
+});
+
+test("telemetry does not fabricate first-token timing for message-end-only peers, and isolates observer failures", async () => {
+	for (const asyncFailure of [false, true]) {
+		const events: RunnerEvent[] = [];
+		const runner = telemetryRunner("telemetry-message-only", { onEvent: (event) => {
+			events.push(event);
+			if (asyncFailure) return Promise.reject(new Error("async observer failed"));
+			throw new Error("observer failed");
+		} });
+		const run = await runner.run(defaults, agent, "no stream");
+		assert.equal(run.status, "ok", run.errorMessage);
+		assert.equal(events.filter((event) => event.type === "first_token").length, 0);
+		assert.equal(events.filter((event) => event.type === "finished").length, 1);
+		assert.equal(events.at(-1)!.type, "finished");
+		assert.deepEqual((await runner.scheduler.snapshot()).leases, []);
+		assert.equal(loadRunById(run.id)?.status, "ok");
+	}
+});
+
+test("telemetry first-token identity resets per attempt, while queued/admitted/finished occur once", async () => {
+	const events: RunnerEvent[] = [];
+	const run = await telemetryRunner("telemetry-retry", { onEvent: (event) => events.push(event) }).run(defaults, agent,
+		"retry timings", { retries: 1, outputFormat: "json" });
+	assert.equal(run.status, "ok", run.errorMessage);
+	assert.equal(run.attempts, 2);
+	assert.deepEqual(events.filter((event) => event.type === "first_token").map((event) => event.attempt), [1, 2]);
+	assert.deepEqual(events.filter((event) => event.type === "settled").map((event) => event.attempt), [1, 2]);
+	for (const type of ["queued", "admitted", "finished"])
+		assert.equal(events.filter((event) => event.type === type).length, 1);
+	assert.equal(events.at(-1)!.attempt, 2);
+});
+
+test("queued/admitted telemetry exposes admission waiting without starting process or prompt timings", { timeout: 5000 }, async () => {
+	const scheduler = new Scheduler(undefined, { concurrency: 1 });
+	const release = await scheduler.acquire("telemetry-blocker");
+	const events: RunnerEvent[] = [];
+	let queued!: () => void;
+	const arrived = new Promise<void>((resolve) => { queued = resolve; });
+	const runner = telemetryRunner("telemetry-message-only", { scheduler, onEvent: (event) => {
+		events.push(event);
+		if (event.type === "queued") queued();
+	} });
+	const pending = runner.run(defaults, agent, "wait for admission");
+	try {
+		await arrived;
+		await delay(120);
+		assert.deepEqual(events.map((event) => event.type), ["queued"]);
+	} finally { await release(); }
+	const run = await pending;
+	assert.equal(run.status, "ok", run.errorMessage);
+	assert.ok(events[1].at - events[0].at >= 100);
+	assert.equal(events[1].type, "admitted");
+	assert.equal(events.at(-1)!.type, "finished");
+});
+
+test("early validation, pre-abort, admission cancellation, and spawn/guard failures still finish telemetry exactly once", async () => {
+	for (const scenario of ["invalid", "aborted", "spawn", "guard", "queue-cancel"]) {
+		const events: RunnerEvent[] = [];
+		const scheduler = new Scheduler(undefined, { concurrency: 1 });
+		const release = scenario === "queue-cancel" ? await scheduler.acquire("early-error-blocker") : undefined;
+		const controller = new AbortController();
+		const runner = scenario === "guard" ? runnerFor("no-guard", { scheduler, onEvent: (event) => events.push(event) }) :
+			telemetryRunner("telemetry-message-only", { scheduler, onEvent: (event) => {
+				events.push(event);
+				if (scenario === "queue-cancel" && event.type === "queued") controller.abort();
+			}, ...(scenario === "spawn" ? { invocation: { command: "/nonexistent/pi-subagents-telemetry" } } : {}) });
+		if (scenario === "aborted") controller.abort();
+		let run;
+		try {
+			run = await runner.run(defaults, agent, "early error", scenario === "invalid" ? { retries: -1 } : {}, undefined, controller.signal);
+		} finally { await release?.(); }
+		assert.notEqual(run.status, "ok", scenario);
+		assert.equal(events.filter((event) => event.type === "finished").length, 1, scenario);
+		assert.equal(events.at(-1)!.type, "finished");
+		assert.equal(events.filter((event) => event.type === "first_token" || event.type === "prompt_sent").length, 0);
+		assert.equal(loadRunById(run.id)?.status, run.status);
+		assert.deepEqual((await scheduler.snapshot()).leases, []);
+	}
 });

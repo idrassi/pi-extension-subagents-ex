@@ -40,11 +40,37 @@ export interface WorktreeInfo {
 	subdirectory?: string;
 }
 
+export type VerificationOutcome = "completed" | "error" | "cancelled" | "incomplete";
+
 export interface VerificationEvidence {
+	/** Identity fields are optional only for legacy saved runs. Calls never merge across attempts. */
+	runId?: string;
+	attempt?: number;
+	toolCallId?: string;
+	parentToolCallId?: string;
+	/** Empty when only an end/result survived and the command is unknown. */
 	command: string;
+	/** Completed means a terminal result was observed, not that exit code zero was inferred. */
+	outcome?: VerificationOutcome;
+	source?: "event" | "transcript" | "event+transcript";
+	/** These flags refer specifically to RPC execution events, not transcript fallback. */
+	startObserved?: boolean;
+	endObserved?: boolean;
+	/** A terminal direct toolResult survived in the transcript (possibly without an RPC end). */
+	resultObserved?: boolean;
 	exitCode?: number;
 	isError?: boolean;
+	/** UTF-8 excerpt, at most 8 KiB. */
 	output: string;
+	outputTruncated?: boolean;
+	/** Stable artifact copy, never a reference into a child's temporary directory. */
+	fullOutputPath?: string;
+	/** Original upstream file, retained only as provenance/final-refresh input, not an artifact. */
+	fullOutputSourcePath?: string;
+	/** False if only an already-truncated/partial output could be preserved. */
+	fullOutputComplete?: boolean;
+	/** Evidence capture warning; never prevents transcript/usage accounting. */
+	outputError?: string;
 }
 
 export interface RunArtifacts {
@@ -70,6 +96,8 @@ export interface AttemptRecord {
 	stderr: string;
 	usage: UsageStats;
 	sessionFile: string;
+	/** Live execution evidence, including nested calls absent from the transcript. */
+	verification?: VerificationEvidence[];
 }
 
 /**

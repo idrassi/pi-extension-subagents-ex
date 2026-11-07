@@ -34,8 +34,16 @@ async function fixture(run: (f: {
 		for (const handler of handlers.get(name) ?? []) result = await handler(event, ctx);
 		return result;
 	};
-	try { await run({ scheduler, ctx, emit, setIdle: (value) => { idle = value; }, aborted: () => aborted }); }
-	finally {
+	let deadline: NodeJS.Timeout | undefined;
+	try {
+		// Production maintenance polling is intentionally unreferenced. A bounded,
+		// referenced fixture deadline keeps Node 22 alive while awaiting that poll.
+		await Promise.race([
+			run({ scheduler, ctx, emit, setIdle: (value) => { idle = value; }, aborted: () => aborted }),
+			new Promise<never>((_resolve, reject) => { deadline = setTimeout(() => reject(new Error("Guard fixture timed out")), 5000); }),
+		]);
+	} finally {
+		if (deadline) clearTimeout(deadline);
 		await emit("session_shutdown");
 		(process as any)[Symbol.for("pi-subagents-ex.orphan-guard")]?.();
 		await release();
